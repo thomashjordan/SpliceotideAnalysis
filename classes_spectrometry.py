@@ -666,223 +666,266 @@ class TargetPeptide:
 class PeptidePeak:
     """Represents an observed peak in the mass spectrum that matches a theoretical peptide or fragment."""
 
-    def __init__(self, experiment: MSExperiment, target: TargetPeptide, charge: int, extracted : pd.DataFrame, raw_apex: pd.DataFrame, rt: float, ms2_data: pd.DataFrame,
-                 rt_start: float = None, rt_end: float = None):
+    def __init__(
+            self,
+            experiment,
+            target,
+            charge: int,
+            extracted: pd.DataFrame,
+            raw_apex: pd.DataFrame,
+            rt: float,
+            ms2_data: pd.DataFrame,
+            rt_start: float = None,
+            rt_end: float = None,
+            is_stub: bool = False,
+    ):
         self.experiment = experiment
         self.target = target
         self.charge = charge
-        self.extracted = extracted
-        # we get the apex from the raw_apex dataframe and sort it by the mz_array column in ascending order
-        self.raw_apex = raw_apex.sort_values(by='mz_array', ascending=True)
+        self.is_stub = is_stub
+
+        # Handle raw_apex indexing safely
+        if raw_apex is not None and not raw_apex.empty:
+            self.raw_apex = raw_apex.sort_values(by="mz_array", ascending=True)
+        else:
+            self.raw_apex = pd.DataFrame(
+                columns=["time", "mz_array", "intensity_array"]
+            )
+
+        self.extracted = (
+            extracted if extracted is not None else pd.DataFrame()
+        )
         self.rt = rt
-        required_isotopologues = self.target.isotopologues["name"]
         self.rt_start = rt_start
         self.rt_end = rt_end
-        required_isotopologues_mz = [(mass + charge * 1.007276466812) / charge for mass in self.target.isotopologues["mass"]]
-        self.isotopologues = {name: mz for name, mz in zip(required_isotopologues, required_isotopologues_mz)}
-        self.ms2_data = ms2_data
+        self.ms2_data = (
+            ms2_data
+            if ms2_data is not None
+            else pd.DataFrame(columns=["fragment_mz", "fragment_int"])
+        )
 
-        self.zoomed_extracted = None
-        self.trapz_area = None
+        # Generate theoretical isotopologue dictionary mapping
+        required_isotopologues = self.target.isotopologues["name"]
+        required_isotopologues_mz = [
+            (mass + charge * 1.007276466812) / charge
+            for mass in self.target.isotopologues["mass"]
+        ]
+        self.isotopologues = {
+            name: mz
+            for name, mz in zip(required_isotopologues, required_isotopologues_mz)
+        }
+
+        # Initialize analysis properties
+        self.zoomed_extracted = pd.DataFrame()
+        self.trapz_area = 0.0 if is_stub else None
         self.gaussian_params, self.gaussian_errors = None, None
 
-        self.raw_apex_interp = None
+        self.raw_apex_interp = pd.DataFrame()
+        self.raw_apex_bin = pd.DataFrame()
+        self.raw_apex_autopique = pd.DataFrame()
         self.mass_spacing = None
-        self.raw_apex_autopique = None
-        self.autopique_noise_mean = 0
-        self.autopique_threshold = 0
+        self.autopique_noise_mean = 0.0
+        self.autopique_threshold = 0.0
         self.autopique_lags = None
         self.autopique_autocorr = None
-        self.scipy_peaks_1, self.scipy_peaks_2 = None, None
-        self.mzs_1, self.mzs_2 = None, None
-        self.intensities_1, self.intensities_2 = None, None
-        self.best_matches = None
-        self.ms2_matches = None
+
+        self.scipy_peaks_1, self.scipy_peaks_2 = pd.DataFrame(), pd.DataFrame()
+        self.mzs_1, self.intensities_1 = np.array([]), np.array([])
+        self.mzs_2, self.intensities_2 = np.array([]), np.array([])
+
+        self.best_matches = pd.DataFrame()
+        self.ms2_matches = pd.DataFrame()
+        self.quality_metrics = {}
+
+        # Pre-populate stub profile data to guarantee structural reliability
+        if self.is_stub:
+            self._fill_stub_defaults()
+
+    @classmethod
+    def create_stub(cls, experiment, target, charge: int, expected_rt: float):
+        """Factory method to generate a placeholder object when a peak is missing
+
+        from a sample, keeping data structures uniform.
+        """
+        return cls(
+            experiment=experiment,
+            target=target,
+            charge=charge,
+            extracted=pd.DataFrame(),
+            raw_apex=pd.DataFrame(),
+            rt=expected_rt,
+            ms2_data=pd.DataFrame(),
+            is_stub=True,
+        )
+
+    def _fill_stub_defaults(self):
+        """Pre-fills match structures with non-detection placeholders to protect
+
+        downstream functions.
+        """
+        self.best_matches = self._match_peaks_to_target(method_number=1)
+        self.process_ms1_quality()
 
     def _estimate_peak_area(self):
-        zoomed_extracted = self.extracted[(self.extracted.index >= self.raw_apex['time'].min()) & (
-                self.extracted.index <= self.raw_apex['time'].max())]
-        # we sort by time
-        zoomed_extracted = zoomed_extracted.sort_index()
+        if self.is_stub or self.extracted.empty or self.raw_apex.empty:
+            self.trapz_area = 0.0
+            return
 
-        # we sum the columns together to get the total intensity at each time point
-        zoomed_extracted['total_intensity'] = zoomed_extracted.sum(axis=1)
+        time_min, time_max = (
+            self.raw_apex["time"].min(),
+            self.raw_apex["time"].max(),
+        )
+        # Use .copy() to eliminate SettingWithCopyWarning errors
+        zoomed = self.extracted[
+            (self.extracted.index >= time_min) & (self.extracted.index <= time_max)
+            ].copy()
+        zoomed = zoomed.sort_index()
 
-        self.zoomed_extracted = zoomed_extracted
-        # we calculate the area using the trapezoidal rule with scipy.integrate.trapz
-        if not zoomed_extracted.empty:
-            self.trapz_area = sp.integrate.trapezoid(zoomed_extracted['total_intensity'], zoomed_extracted.index)
+        zoomed["total_intensity"] = zoomed.sum(axis=1)
+        self.zoomed_extracted = zoomed
 
-        pass
+        if not zoomed.empty:
+            self.trapz_area = sp.integrate.trapezoid(
+                zoomed["total_intensity"], zoomed.index
+            )
+        else:
+            self.trapz_area = 0.0
 
     def _fit_asym_gaussian(self):
-        """Fits an asymmetric Gaussian to the raw extracted data around the apex."""
-        # we guess the parameters
-        parguess = (max([self.trapz_area, 101]), self.rt, 0.03, 0.1, max(self.zoomed_extracted['total_intensity'].min(), 101))
+        if (
+                self.is_stub
+                or self.zoomed_extracted.empty
+                or "total_intensity" not in self.zoomed_extracted.columns
+        ):
+            return
+
+        parguess = (
+            max([self.trapz_area, 101]),
+            self.rt,
+            0.03,
+            0.1,
+            max(self.zoomed_extracted["total_intensity"].min(), 101),
+        )
         try:
             gaussian_params, pcov = sp.optimize.curve_fit(
-                asym_peak, self.zoomed_extracted.index, self.zoomed_extracted['total_intensity'], p0=parguess, maxfev=1e6,
-                bounds = ((100, 0.1, 0.001, 0.01, 100), (10e11, self.zoomed_extracted.index.max(), 2, 100, 10e9)),method='trf')
-            # a0 = pars[0]  # peak area
-            # a1 = pars[1]  # elution time
-            # a2 = pars[2]  # width of gaussian
-            # a3 = pars[3]  # exponential damping term
-            # a4 - baseline adjustment
-            errors = np.sqrt(np.diag(pcov))
+                asym_peak,
+                self.zoomed_extracted.index,
+                self.zoomed_extracted["total_intensity"],
+                p0=parguess,
+                maxfev=int(1e6),
+                bounds=(
+                    (100, 0.1, 0.001, 0.01, 100),
+                    (10e11, self.zoomed_extracted.index.max(), 2, 100, 10e9),
+                ),
+                method="trf",
+            )
             self.gaussian_params = gaussian_params
-            self.gaussian_errors = errors
+            self.gaussian_errors = np.sqrt(np.diag(pcov))
         except Exception as e:
             print(f"Warning: Could not fit asymmetric Gaussian: {e}")
-            print(f"Parameters: {parguess}")
             self.gaussian_params = None
             self.gaussian_errors = None
-        pass
-
 
     def _estimate_mass_spacing(self):
-        """Estimates the mass spacing in the raw spectrum around the peak apex."""
-        if self.raw_apex is None or self.raw_apex.empty:
-            print("Warning: raw_apex data is empty. Cannot estimate mass spacing.")
+        if self.raw_apex.empty:
             return None
-
-        mzs = self.raw_apex['mz_array'].values
+        mzs = np.sort(self.raw_apex["mz_array"].values)
         if len(mzs) < 2:
-            print("Warning: Not enough data points to estimate mass spacing.")
             return None
+        self.mass_spacing = max(np.diff(mzs).min(), 0.005)
 
-        # we calculate the differences between consecutive m/z values
-        # we sort the mzs first
-        mzs = np.sort(mzs)
-        min_mz = min(mzs)
-        max_mz = max(mzs)
-        min_delta = np.diff(mzs).min()
-        mass_spacing = max(np.diff(mzs).min(), 0.005)
-        # we take the median of the deltas as the mass spacing
-        self.mass_spacing = mass_spacing
-        pass
-
-    def _interpolate_peak_mzs(self, interp_dist: float=0.0005):
-        """Interpolates the m/z values around the peak apex for better accuracy."""
-        if self.raw_apex is None or self.raw_apex.empty:
-            print("Warning: raw_apex data is empty. Cannot interpolate m/z values.")
-            return pd.DataFrame()
-
-        mzs = self.raw_apex['mz_array'].values
-        min_mz, max_mz = np.min(mzs), np.max(mzs)
-        intensities = self.raw_apex['intensity_array'].values
-
+    def _interpolate_peak_mzs(self, interp_dist: float = 0.0005):
+        if self.raw_apex.empty or self.mass_spacing is None:
+            return
+        mzs = self.raw_apex["mz_array"].values
+        intensities = self.raw_apex["intensity_array"].values
         if len(mzs) < 2:
-            print("Warning: Not enough data points to interpolate.")
-            return pd.DataFrame()
+            return
 
-        # we create the new m/z array
-        new_mzs = np.arange(min_mz, max_mz, self.mass_spacing)
-        # we interpolate the intensities using the interpolate_uneven_data function
-        new_intensities = interpolate_uneven_data(mzs, intensities, new_mzs, distance=interp_dist)
-        interpolated_df = pd.DataFrame({'mz_array': new_mzs, 'intensity_array': new_intensities})
-        self.raw_apex_interp = interpolated_df
-        pass
+        new_mzs = np.arange(np.min(mzs), np.max(mzs), self.mass_spacing)
+        new_intensities = interpolate_uneven_data(
+            mzs, intensities, new_mzs, distance=interp_dist
+        )
+        self.raw_apex_interp = pd.DataFrame(
+            {"mz_array": new_mzs, "intensity_array": new_intensities}
+        )
 
-    def _bin_peak_mzs(self, bin_size: float=0.0005):
-        """Bins the m/z values around the peak apex to reduce noise and make mys uniformly spaced."""
-        if self.raw_apex is None or self.raw_apex.empty:
-            print("Warning: raw_apex data is empty. Cannot bin m/z values.")
-            return pd.DataFrame()
-
-        mzs = self.raw_apex['mz_array'].values
-        intensities = self.raw_apex['intensity_array'].values
-
+    def _bin_peak_mzs(self, bin_size: float = 0.0005):
+        if self.raw_apex.empty:
+            return
+        mzs = self.raw_apex["mz_array"].values
+        intensities = self.raw_apex["intensity_array"].values
         if len(mzs) < 2:
-            print("Warning: Not enough data points to bin.")
-            return pd.DataFrame()
+            return
 
-        # we create the bins
         min_mz, max_mz = np.min(mzs), np.max(mzs)
         bins = np.arange(min_mz, max_mz + bin_size, bin_size)
-        # we digitize the m/z values into the bins
-        bin_indices = np.digitize(mzs, bins) - 1  # -1 to convert to 0-based index
-        # we sum the intensities in each bin
+        bin_indices = np.clip(np.digitize(mzs, bins) - 1, 0, len(bins) - 1)
+
         binned_intensities = np.zeros(len(bins))
         for i in range(len(mzs)):
             binned_intensities[bin_indices[i]] += intensities[i]
-        binned_df = pd.DataFrame({'mz_array': bins, 'intensity_array': binned_intensities})
-        self.raw_apex_bin= binned_df
-        pass
 
-    def _autopique_threshold_estimation(self, snr_level: int = 2, initial_threshold: int = None):
-        """Applies an automatic thresholding method to determine significant peaks."""
+        self.raw_apex_bin = pd.DataFrame(
+            {"mz_array": bins, "intensity_array": binned_intensities}
+        )
 
-        # 1. Safely handle empty upstream data and assign an empty DataFrame so it's not None
-        if getattr(self, 'raw_apex', None) is None or self.raw_apex.empty:
-            print("Warning: raw_apex data is empty. Cannot apply autopique threshold.")
+    def _autopique_threshold_estimation(
+            self, snr_level: int = 2, initial_threshold: int = None
+    ):
+        if self.raw_apex.empty:
             self.raw_apex_autopique = pd.DataFrame()
             return self.raw_apex_autopique
 
-        # we get the m/z and intensity arrays
-        mzs = self.raw_apex['mz_array'].values
-        intensities = self.raw_apex['intensity_array'].values
+        mzs = self.raw_apex["mz_array"].values
+        intensities = self.raw_apex["intensity_array"].values
         max_intensity = np.max(intensities)
 
-        # If the spectrum is basically empty noise, exit early
         if max_intensity <= 100:
             self.raw_apex_autopique = self.raw_apex_interp.copy()
             return self.raw_apex_autopique
 
-        # RESAMPLING
-        # we get the smallest delta between the mzs
         resample_delta = max(self.mass_spacing, 1e-6)
-        # we perform linear interpolation using np interp
         new_mzs = np.arange(min(mzs), max(mzs) + resample_delta, resample_delta)
         new_intensities = np.interp(new_mzs, mzs, intensities)
 
-        # 2. DYNAMIC THRESHOLD STEP
-        # Instead of a hardcoded 500, we step up by 0.5% of the maximum intensity.
-        # This ensures the loop always works gracefully regardless of the instrument's intensity scale.
         step_size = max(max_intensity / 100.0, 0.5)
-
-        filtered = new_intensities.copy()
-        best_threshold = 0
-        lags_final = np.array([])
-        autocorr_final = np.array([])
+        best_threshold = 0.0
+        lags_final, autocorr_final = np.array([]), np.array([])
 
         for i in range(100):
             threshold = step_size * i
-
-            # Safety Check 1: Don't let the threshold exceed the max intensity
             if threshold >= max_intensity:
                 break
 
             filtered = np.where(new_intensities < threshold, 0, new_intensities)
+            autocorr = sp.signal.correlate(filtered, filtered, method="auto")
 
-            # Autocorrelation
-            autocorr = sp.signal.correlate(filtered, filtered, method='auto')
-
-            # Safety Check 2: Prevent division by zero
             max_ac = np.max(autocorr)
             if max_ac == 0:
                 break
 
-            autocorr = autocorr / max_ac
+            autocorr /= max_ac
+            lags = (
+                    np.arange(-len(autocorr) // 2 + 1, len(autocorr) // 2 + 1)
+                    * self.mass_spacing
+            )
 
-            # Lag array creation
-            lags = np.arange(-len(autocorr) // 2 + 1, len(autocorr) // 2 + 1) * self.mass_spacing
-
-            # Slice to the desired lag window
             mask = (lags >= -0.5) & (lags <= 2.55)
             autocorr_window = autocorr[mask]
             lags_window = lags[mask]
 
-            # Safety Check 3: Ensure the lag window isn't empty
             if len(autocorr_window) == 0:
                 break
 
-            prop_below = len(autocorr_window[autocorr_window <= 0]) / len(autocorr_window)
+            prop_below = (
+                    len(autocorr_window[autocorr_window <= 0]) / len(autocorr_window)
+            )
             peak_index = np.argmax(autocorr_window)
 
-            # Safety Check 4: Handle peak_widths safely
-            peak_widths = sp.signal.peak_widths(autocorr_window, [peak_index], rel_height=0.95)
-            # Since we have the FWHM, we multiply it by two to get the actual width (not super scientific but whatever)
-            #peak_widths = peak_widths * 2
+            peak_widths = sp.signal.peak_widths(
+                autocorr_window, [peak_index], rel_height=0.95
+            )
 
             if len(peak_widths[2]) > 0 and len(peak_widths[3]) > 0:
                 peak_left = int(peak_widths[2][0])
@@ -894,298 +937,419 @@ class PeptidePeak:
                     lags_final = lags_window
                     autocorr_final = autocorr_window
                     break
-            else:
-                # If peak_widths fails to find bounds, the threshold is likely breaking the signal.
-                pass
 
-        # If the loop finished but never met the condition, fallback to a sensible baseline
-        if best_threshold == 0:
-            best_threshold = threshold  # at least apply the last threshold
+        if best_threshold == 0.0:
+            best_threshold = step_size * 99
 
-        # Calculate noise mean safely
-        below_thresh_intensities = new_intensities[new_intensities < best_threshold]
-        noise_mean = np.mean(below_thresh_intensities) if len(below_thresh_intensities) > 0 else 0.0
+        below_thresh = new_intensities[new_intensities < best_threshold]
+        noise_mean = np.mean(below_thresh) if len(below_thresh) > 0 else 0.0
 
-        # Apply final SNR threshold
         snr_threshold = snr_level * (best_threshold - noise_mean) + noise_mean
         snr_threshold = min(snr_threshold, max_intensity * 0.90)
         final_filtered = np.where(new_intensities < snr_threshold, 0, new_intensities)
 
-        # Save results
-        self.raw_apex_autopique = pd.DataFrame({
-            'mz_array': new_mzs,
-            'intensity_array': final_filtered
-        })
+        self.raw_apex_autopique = pd.DataFrame(
+            {"mz_array": new_mzs, "intensity_array": final_filtered}
+        )
         self.autopique_threshold = snr_threshold
         self.autopique_lags = lags_final
         self.autopique_autocorr = autocorr_final
 
         return self.raw_apex_autopique
 
+    def _find_ms1_peaks_scipy(
+            self,
+            distance: float = 0.01,
+            prominence: float = 0.5,
+            rel_height: float = 0.2,
+            height: float = 1000,
+            data_source: str = "bin",
+            method: str = "find_peaks",
+            bin_size: float = 0.0005,
+    ):
+        if self.is_stub:
+            return pd.DataFrame(), np.array([]), np.array([])
 
-    def _find_ms1_peaks_scipy(self, distance: float = 0.01, prominence: float = 0.5, rel_height: float = 0.2,
-                              height: float = 1000,
-                              data_source: str = 'bin', method: str = 'find_peaks', bin_size: float = 0.0005):
-        """Finds peaks in the raw spectrum using scipy's find_peaks or find_peaks_cwt function.
-        Args:
-            distance (float): Minimum distance between peaks in m/z units.
-            prominence (float): Required prominence of peaks.
-            rel_height (float): Relative height for peak width calculation.
-            height (float): Minimum height of peaks.
-            data_source (str): Source of data to use ('bin', 'interp', 'autopique', or 'raw').
-            method (str): Method to use for finding peaks. ('find_peaks' or 'find_peaks_cwt')
-            bin_size (float): Bin size for 'bin' or 'interp' data source.
-        Returns:
-            pd.DataFrame: DataFrame containing the detected peaks with 'mz_array' and 'intensity_array' columns.
-        """
-        mzs = np.array([])
-        intensities = np.array([])
-        distance_points = None
-        peak_width_points = None
+        mzs, intensities = np.array([]), np.array([])
+        distance_points = 1
 
-        # 1. LOAD DATA & SET DISTANCES
-        if data_source == 'raw':
-            if self.raw_apex is None or self.raw_apex.empty:
-                print("Warning: raw_apex data is empty. Cannot find peaks using scipy.")
-                return pd.DataFrame()
-            mzs = self.raw_apex['mz_array'].values
-            intensities = self.raw_apex['intensity_array'].values
+        if data_source == "raw" and not self.raw_apex.empty:
+            mzs = self.raw_apex["mz_array"].values
+            intensities = self.raw_apex["intensity_array"].values
             distance_points = max(50, int(distance / self.mass_spacing))
-
-        elif data_source == 'interp':
-            if self.raw_apex_interp is None or self.raw_apex_interp.empty:
-                print("Warning: raw_apex_interp data is empty. Cannot find peaks using scipy.")
-                return pd.DataFrame()
-            mzs = self.raw_apex_interp['mz_array'].values
-            intensities = self.raw_apex_interp['intensity_array'].values
+        elif data_source == "interp" and not self.raw_apex_interp.empty:
+            mzs = self.raw_apex_interp["mz_array"].values
+            intensities = self.raw_apex_interp["intensity_array"].values
             distance_points = max(1, int(distance / bin_size))
-
-        elif data_source == 'autopique':
-            if self.raw_apex_autopique is None or self.raw_apex_autopique.empty:
-                print("Warning: raw_apex_autopique data is empty. Cannot find peaks using scipy.")
-                return pd.DataFrame()
-            mzs = self.raw_apex_autopique['mz_array'].values
-            intensities = self.raw_apex_autopique['intensity_array'].values
+        elif data_source == "autopique" and not self.raw_apex_autopique.empty:
+            mzs = self.raw_apex_autopique["mz_array"].values
+            intensities = self.raw_apex_autopique["intensity_array"].values
             distance_points = max(1, int(distance / np.diff(mzs)[0]))
-
-        elif data_source == 'bin':
-            if self.raw_apex_bin is None or self.raw_apex_bin.empty:
-                print("Warning: raw_apex_bin data is empty. Cannot find peaks using scipy.")
-                return pd.DataFrame()
-            mzs = self.raw_apex_bin['mz_array'].values
-            intensities = self.raw_apex_bin['intensity_array'].values
+        elif data_source == "bin" and not self.raw_apex_bin.empty:
+            mzs = self.raw_apex_bin["mz_array"].values
+            intensities = self.raw_apex_bin["intensity_array"].values
             distance_points = max(1, int(distance / bin_size))
 
-        # 2. CALCULATE WIDTHS (Shared logic for uniform data)
+        if len(mzs) == 0:
+            return pd.DataFrame(), mzs, intensities
+
         cwt_widths = None
-        if data_source != 'raw' and len(mzs) > 0:
-            R = 17500  # QExactive worst-case scenario
-            min_mz, max_mz = np.min(mzs), np.max(mzs)
+        if data_source != "raw":
+            R = 17500
+            min_width_pts = (np.min(mzs) / R) / bin_size
+            max_width_pts = (np.max(mzs) / R) / bin_size
+            cwt_widths = np.arange(
+                max(1, int(min_width_pts * 0.8)), int(max_width_pts * 1.2)
+            )
 
-            # Convert to points using bin/interp size
-            min_width_pts = (min_mz / R) / bin_size
-            max_width_pts = (max_mz / R) / bin_size
-
-            # For find_peaks: tuple of (min_width, max_width)
-            peak_width_points = (max(1, min_width_pts * 0.5), max_width_pts * 1.5)
-
-            # For find_peaks_cwt: array of test scales
-            cwt_widths = np.arange(max(1, int(min_width_pts * 0.8)), int(max_width_pts * 1.2))
-
-        # 3. PEAK FINDING
         peaks_indices = []
         properties = {}
-        if data_source == 'autopique':
-            if self.autopique_threshold is None:
-                height = height  # Use user-provided height if autopique threshold is not set
-            # For autopique, we use the estimated threshold as the height parameter for find_peaks to ensure we only get significant peaks
-            else:
-                height = self.autopique_threshold * 1.5 # We can adjust this multiplier based on how aggressive we want to be
-        if method == 'find_peaks':
-            approx_peak_indices, properties = sp.signal.find_peaks(
+
+        if data_source == "autopique" and self.autopique_threshold is not None:
+            height = self.autopique_threshold * 1.5
+
+        if method == "find_peaks":
+            peaks_indices, properties = sp.signal.find_peaks(
                 intensities,
                 distance=distance_points,
                 prominence=prominence,
                 rel_height=rel_height,
-                height=height
+                height=height,
             )
-            peaks_indices = approx_peak_indices
-            '''
-            # we find the true corresponding peak by looking in a small window around the peak
+        elif method == "find_peaks_cwt" and data_source != "raw":
+            approx_indices = sp.signal.find_peaks_cwt(
+                intensities, cwt_widths, min_snr=2, noise_perc=50
+            )
             snapped_indices = []
-            window_peak = 31  # points to look around the cwt peak for the true maximum
-            for idx in approx_peak_indices:
-                start, end = max(0, idx - window_peak), min(len(intensities), idx + window_peak + 1)
+            window_cwt_peak = 11
+            for idx in approx_indices:
+                start, end = max(0, idx - window_cwt_peak), min(
+                    len(intensities), idx + window_cwt_peak + 1
+                )
                 local_max_idx = np.argmax(intensities[start:end]) + start
                 snapped_indices.append(local_max_idx)
             peaks_indices = np.unique(snapped_indices)
-            '''
-        elif method == 'find_peaks_cwt':
-            if data_source == 'raw':
-                print("Warning: find_peaks_cwt method is not suitable for raw data. Use 'find_peaks' instead.")
-                return pd.DataFrame()
-            else:
-                # NOTE: CWT finds approximate location of peak not true maximum
-                # We use noise_perc=50 instead of 10 for MS data (see rationale below)
-                approx_peaks_indices = sp.signal.find_peaks_cwt(
-                    intensities,
-                    cwt_widths,
-                    min_snr=2,
-                    noise_perc=50
-                )
 
-                # we find the true corresponding peak by looking in a small window around the peak
-                snapped_indices = []
-                window_cwt_peak = 11  # points to look around the cwt peak for the true maximum
-                for idx in approx_peaks_indices:
-                    start, end = max(0, idx - window_cwt_peak), min(len(intensities), idx + window_cwt_peak + 1)
-                    local_max_idx = np.argmax(intensities[start:end]) + start
-                    snapped_indices.append(local_max_idx)
-                peaks_indices = np.unique(snapped_indices)
-
-
-        # 4. PREPARE OUTPUT
-        # Safely handle if no peaks are found
         if len(peaks_indices) == 0:
             return pd.DataFrame(), mzs, intensities
 
-        peak_mzs = mzs[peaks_indices]
-        peak_intensities = intensities[peaks_indices]
-
-        peaks_df = pd.DataFrame({
-            'mz_array_peak': peak_mzs,
-            'intensity_array_peak': peak_intensities,
-            'data_source': data_source,
-            'method': method,
-            # properties is a dict, storing it directly in a column is messy but works if needed for later inspection
-            'properties': [properties] * len(peak_mzs) if method == 'find_peaks' else None
-        })
-
+        peaks_df = pd.DataFrame(
+            {
+                "mz_array_peak": mzs[peaks_indices],
+                "intensity_array_peak": intensities[peaks_indices],
+                "data_source": data_source,
+                "method": method,
+                "properties": [properties] * len(peaks_indices)
+                if method == "find_peaks"
+                else None,
+            }
+        )
         return peaks_df, mzs, intensities
 
     def _match_peaks_to_target(self, method_number: int = 1, tolerance: float = 10):
-        """Matches the detected peaks to the theoretical m/z values."""
+        # Establish default structure columns
+        columns_layout = [
+            "isotopologue",
+            "theoretical_mz",
+            "observed_mz",
+            "error_ppm",
+            "theoretical_abundance",
+            "observed_abundance",
+            "other_peak_in_window",
+            "observed_abundance_norm",
+        ]
+
+        target_names = ["decoy-1"] + self.target.isotopologues["name"]
+        target_masses = [
+                            self.target.monoisotopic_mass - 1.0
+                        ] + self.target.isotopologues["mass"]
+        target_mzs = np.array(
+            [
+                (mass + self.charge * 1.007276466812) / self.charge
+                for mass in target_masses
+            ]
+        )
+
+        # Handle structural stub assignment early to eliminate downstream issues
+        if self.is_stub:
+            matches = {col: [] for col in columns_layout}
+            for tgt_mz, tgt_name in zip(target_mzs, target_names):
+                try:
+                    idx = self.target.isotopologues["name"].index(tgt_name)
+                    theo_abund = float(self.target.isotopologues["abundance"][idx])
+                except ValueError:
+                    theo_abund = 0.0
+
+                matches["isotopologue"].append(tgt_name)
+                matches["theoretical_mz"].append(float(tgt_mz))
+                matches["observed_mz"].append(np.nan)
+                matches["error_ppm"].append(np.nan)
+                matches["theoretical_abundance"].append(theo_abund)
+                matches["observed_abundance"].append(0.0)
+                matches["other_peak_in_window"].append(False)
+                matches["observed_abundance_norm"].append(0.0)
+            return pd.DataFrame(matches)
 
         if method_number == 1:
-            peaks_df = self.scipy_peaks_1.copy()
-            mzs = self.mzs_1
-            intensities = self.intensities_1
-        elif method_number == 2:
-            peaks_df = self.scipy_peaks_2.copy()
-            mzs = self.mzs_2
-            intensities = self.intensities_2
+            peaks_df, mzs, intensities = (
+                self.scipy_peaks_1,
+                self.mzs_1,
+                self.intensities_1,
+            )
         else:
-            print(f"Warning: Invalid method_number {method_number}. Must be 1 or 2.")
-            return pd.DataFrame()
+            peaks_df, mzs, intensities = (
+                self.scipy_peaks_2,
+                self.mzs_2,
+                self.intensities_2,
+            )
 
-        # 1. Early exit if no peaks were found by the peak picker
         if peaks_df.empty:
-            # FIX: Return a DataFrame with the correct columns, even if it's empty.
-            # This prevents KeyErrors in downstream functions.
-            return pd.DataFrame(columns=[
-                'isotopologue', 'theoretical_mz', 'observed_mz', 'error_ppm',
-                'theoretical_abundance', 'observed_abundance', 'other_peak_in_window',
-                'observed_abundance_norm'
-            ])
+            matches = {col: [] for col in columns_layout}
+            for tgt_mz, tgt_name in zip(target_mzs, target_names):
+                try:
+                    idx = self.target.isotopologues["name"].index(tgt_name)
+                    theo_abund = float(self.target.isotopologues["abundance"][idx])
+                except ValueError:
+                    theo_abund = 0.0
+                matches["isotopologue"].append(tgt_name)
+                matches["theoretical_mz"].append(float(tgt_mz))
+                matches["observed_mz"].append(np.nan)
+                matches["error_ppm"].append(np.nan)
+                matches["theoretical_abundance"].append(theo_abund)
+                matches["observed_abundance"].append(0.0)
+                matches["other_peak_in_window"].append(False)
+                matches["observed_abundance_norm"].append(0.0)
+            return pd.DataFrame(matches)
 
-        # Extract only the arrays we care about
-        peak_mzs = peaks_df['mz_array_peak'].values
-        peak_intensities = peaks_df['intensity_array_peak'].values
+        peak_mzs = peaks_df["mz_array_peak"].values
+        peak_intensities = peaks_df["intensity_array_peak"].values
 
-        target_names = ["decoy-1"] + self.target.isotopologues['name']
-        target_masses = [self.target.monoisotopic_mass - 1.0] + self.target.isotopologues['mass']
-        target_mzs = np.array([(mass + self.charge * 1.007276466812) / self.charge for mass in target_masses])
-
-        matches = {
-            'isotopologue': [], 'theoretical_mz': [], 'observed_mz': [],
-            'error_ppm': [], 'theoretical_abundance': [], 'observed_abundance': [],
-            'other_peak_in_window': [], 'observed_abundance_norm': []
-        }
-
-        # Convert ppm tolerance to m/z window at the monoisotopic mass
+        matches = {col: [] for col in columns_layout}
         mz_tolerance = (target_mzs[1] * tolerance / 1e6) / self.charge
 
         for tgt_mz, tgt_name in zip(target_mzs, target_names):
-            # Define local search window (wider than the strict tolerance)
             mz_delta = 3 / (4 * self.charge)
-            start = tgt_mz - mz_delta
-            end = tgt_mz + mz_delta
+            window_indices = np.where(
+                (peak_mzs >= tgt_mz - mz_delta) & (peak_mzs <= tgt_mz + mz_delta)
+            )[0]
 
-            # Find pre-calculated peaks inside this wider window
-            window_indices = np.where((peak_mzs >= start) & (peak_mzs <= end))[0]
-
-            # Default values for missing peaks
-            obs_mz = np.nan
-            obs_int = 0.0
-            err_ppm = np.nan
+            obs_mz, obs_int, err_ppm = np.nan, 0.0, np.nan
             other_peaks = False
 
             if len(window_indices) > 0:
                 window_peak_mzs = peak_mzs[window_indices]
                 window_peak_ints = peak_intensities[window_indices]
 
-                # Filter to peaks within the strict ppm tolerance
-                close_indices = np.where(np.abs(window_peak_mzs - tgt_mz) <= mz_tolerance)[0]
+                close_indices = np.where(
+                    np.abs(window_peak_mzs - tgt_mz) <= mz_tolerance
+                )[0]
 
                 if len(close_indices) > 0:
-                    # Pick the most abundant peak in the strict tolerance window
                     best_relative_idx = np.argmax(window_peak_ints[close_indices])
                     best_idx = close_indices[best_relative_idx]
 
-                    # FORCE SCALARS to prevent tuple/array bugs
                     obs_mz = float(window_peak_mzs[best_idx])
                     obs_int = float(window_peak_ints[best_idx])
                     err_ppm = float(((obs_mz - tgt_mz) / tgt_mz) * 1e6)
 
-                    # Check if there are other, unassigned peaks in the wider window
-                    # if those peaks have over 30 % of the intensity of the assigned peak,
-                    # we flag it as a potential interference
                     if len(window_indices) > 1:
                         other_ints = np.delete(window_peak_ints, close_indices)
-                        if len(other_ints) > 0 and np.any(other_ints > 0.3 * obs_int):
+                        if len(other_ints) > 0 and np.any(
+                                other_ints > 0.3 * obs_int
+                        ):
                             other_peaks = True
                 else:
-                    # Peaks in window, but none within tight tolerance
                     other_peaks = True
 
-            # Get theoretical abundance
             try:
-                idx = self.target.isotopologues['name'].index(tgt_name)
-                theo_abund = float(self.target.isotopologues['abundance'][idx])
+                idx = self.target.isotopologues["name"].index(tgt_name)
+                theo_abund = float(self.target.isotopologues["abundance"][idx])
             except ValueError:
                 theo_abund = 0.0
 
-            # Append clean, scalar values
-            matches['isotopologue'].append(tgt_name)
-            matches['theoretical_mz'].append(float(tgt_mz))
-            matches['observed_mz'].append(obs_mz)
-            matches['error_ppm'].append(err_ppm)
-            matches['theoretical_abundance'].append(theo_abund)
-            matches['observed_abundance'].append(obs_int)
-            matches['other_peak_in_window'].append(other_peaks)
-            matches['observed_abundance_norm'].append(0.0) # Initialize with a placeholder
+            matches["isotopologue"].append(tgt_name)
+            matches["theoretical_mz"].append(float(tgt_mz))
+            matches["observed_mz"].append(obs_mz)
+            matches["error_ppm"].append(err_ppm)
+            matches["theoretical_abundance"].append(theo_abund)
+            matches["observed_abundance"].append(obs_int)
+            matches["other_peak_in_window"].append(other_peaks)
+            matches["observed_abundance_norm"].append(0.0)
 
         matches_df = pd.DataFrame(matches)
-
-        total_observed = matches_df['observed_abundance'].sum()
+        total_observed = matches_df["observed_abundance"].sum()
         if total_observed > 0:
-            matches_df['observed_abundance_norm'] = matches_df['observed_abundance'] / total_observed
-        else:
-            matches_df['observed_abundance_norm'] = 0.0
+            matches_df["observed_abundance_norm"] = (
+                    matches_df["observed_abundance"] / total_observed
+            )
 
         return matches_df
 
     def integrate_peak(self):
-        """Runs the peak area estimation and asymmetric Gaussian fitting."""
-        if self.raw_apex is None or self.raw_apex.empty:
-            print("Integration failed: Initial raw_apex data is missing.")
+        if self.is_stub:
+            self.trapz_area = 0.0
             return
         self._estimate_peak_area()
-        if self.zoomed_extracted is None or self.zoomed_extracted.empty:
-            print("Integration failed: Zoomed extracted data is missing.")
-            return
         self._fit_asym_gaussian()
-        pass
+
+    def process_and_find_peaks(
+            self,
+            snr_level: int = 2,
+            autopique_init: int = 500,
+            prominence: float = 0.5,
+            height: float = 1000,
+            rel_height: float = 0.2,
+            ms1_distance: float = 0.05,
+            settings_1: tuple = ("bin", "find_peaks_cwt"),
+            settings_2: tuple = ("autopique", "find_peaks"),
+            bin_size: float = 0.0005,
+    ):
+        if self.is_stub or self.raw_apex.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        self._estimate_mass_spacing()
+        self._interpolate_peak_mzs(interp_dist=bin_size)
+        self._bin_peak_mzs(bin_size=bin_size)
+        self._autopique_threshold_estimation(
+            snr_level=snr_level, initial_threshold=autopique_init
+        )
+
+        self.scipy_peaks_1, self.mzs_1, self.intensities_1 = (
+            self._find_ms1_peaks_scipy(
+                distance=ms1_distance,
+                prominence=prominence,
+                height=height,
+                rel_height=rel_height,
+                data_source=settings_1[0],
+                method=settings_1[1],
+                bin_size=bin_size,
+            )
+        )
+
+        self.scipy_peaks_2, self.mzs_2, self.intensities_2 = (
+            self._find_ms1_peaks_scipy(
+                distance=ms1_distance,
+                prominence=prominence,
+                height=height,
+                rel_height=rel_height,
+                data_source=settings_2[0],
+                method=settings_2[1],
+                bin_size=bin_size,
+            )
+        )
+
+        return self.scipy_peaks_1, self.scipy_peaks_2
+
+    def validate_ms1_pattern(self, tolerance_ppm: float = 20):
+        if self.is_stub:
+            self.peak_finding_both_methods = False
+            self.peak_finding_good = False
+            self.peak_finding_ok = False
+            self.peak_finding_warning = True
+            return self.best_matches
+
+        def _score_matches(df):
+            if df is None or df.empty:
+                return 0, float("inf")
+            valid = df[
+                (df["isotopologue"] != "decoy-1") & (df["observed_mz"].notna())
+                ]
+            num_matches = len(valid)
+            median_error = (
+                np.median(np.abs(valid["error_ppm"]))
+                if num_matches > 0
+                else float("inf")
+            )
+            return num_matches, median_error
+
+        self.matches_1 = self._match_peaks_to_target(1, tolerance=tolerance_ppm)
+        self.matches_2 = self._match_peaks_to_target(2, tolerance=tolerance_ppm)
+
+        score1_count, score1_err = _score_matches(self.matches_1)
+        score2_count, score2_err = _score_matches(self.matches_2)
+
+        self.peak_finding_both_methods = score1_count > 0 and score2_count > 0
+        self.peak_finding_good = (
+                score1_count > 0
+                and score1_err < tolerance_ppm
+                and score2_count > 0
+                and score2_err < tolerance_ppm
+        )
+        self.peak_finding_ok = score1_count > 0 or score2_count > 0
+        self.peak_finding_warning = score1_count == 0 and score2_count == 0
+
+        if score1_count > score2_count:
+            self.best_matches = self.matches_1.copy()
+        elif score2_count > score1_count:
+            self.best_matches = self.matches_2.copy()
+        else:
+            self.best_matches = (
+                self.matches_1.copy()
+                if score1_err <= score2_err
+                else self.matches_2.copy()
+            )
+
+        return self.best_matches
+
+    def process_ms1_quality(self, ppm_error: float = 10):
+        # Stub profile initialization handling
+        if self.is_stub or self.best_matches.empty:
+            self.quality_metrics = {
+                "peak_finding_ok": False,
+                "peak_finding_warning": True,
+                "peak_matches_similar": False,
+                "decoy_unmatched": True,
+                "other_peaks": False,
+                "median_error_ppm": np.nan,
+                "quality_pass": False,
+                "overall_pass": False,
+                "final_trapz_area": 0.0,
+                "final_gaussian_params": None,
+                "final_gaussian_errors": None,
+            }
+            return False
+
+        matches = self.best_matches
+
+        # 1. Decoy (M-1) Check
+        decoy = matches[matches["isotopologue"] == "decoy-1"]
+        decoy_mz_is_nan = pd.isna(decoy["observed_mz"]).any()
+        decoy_abundance_is_zero = (decoy["observed_abundance"] == 0.0).any()
+        decoy_unmatched = bool(decoy_mz_is_nan and decoy_abundance_is_zero)
+
+        # 2. Evaluate actual targets
+        others = matches[matches["isotopologue"] != "decoy-1"]
+        other_peaks_flag = bool(others["other_peak_in_window"].any())
+
+        # 3. Mass Accuracy Check
+        valid_errors = others["error_ppm"].dropna()
+        if not valid_errors.empty:
+            median_error = float(np.median(np.abs(valid_errors)))
+            quality_pass = bool(median_error < ppm_error)
+        else:
+            median_error = np.nan
+            quality_pass = False
+
+        # 4. Overall pass score validation logic
+        overall_pass = bool(decoy_unmatched and quality_pass)
+
+        self.quality_metrics = {
+            "peak_finding_ok": getattr(self, "peak_finding_ok", False),
+            "peak_finding_warning": getattr(self, "peak_finding_warning", True),
+            "peak_matches_similar": getattr(
+                self, "peak_matches_similar", False
+            ),
+            "decoy_unmatched": decoy_unmatched,
+            "other_peaks": other_peaks_flag,
+            "median_error_ppm": median_error,
+            "quality_pass": quality_pass,
+            "overall_pass": overall_pass,
+            "final_trapz_area": self.trapz_area,
+            "final_gaussian_params": self.gaussian_params,
+            "final_gaussian_errors": self.gaussian_errors,
+        }
+
+        return overall_pass
 
     def process_and_find_peaks(self, snr_level: int = 2, autopique_init:int=500,
                                prominence: float = 0.5, height: float = 1000, rel_height: float=0.2,
@@ -1236,124 +1400,6 @@ class PeptidePeak:
         self.mzs_2, self.intensities_2 = mzs_2, intensities_2
         return self.scipy_peaks_1, self.scipy_peaks_2
 
-    def validate_ms1_pattern(self, tolerance_ppm: float = 20):
-        """Validates the observed isotopic pattern against theoretical expectations."""
-
-        # Helper function to score a match DataFrame
-        def _score_matches(df):
-            if df is None or df.empty:
-                return 0, float('inf')  # 0 matches, infinite error
-
-            # Filter out the decoy and look only at successfully matched targets
-            valid = df[(df['isotopologue'] != 'decoy-1') & (df['observed_mz'].notna())]
-            num_matches = len(valid)
-
-            if num_matches > 0:
-                median_error = np.median(np.abs(valid['error_ppm']))
-            else:
-                median_error = float('inf')
-
-            return num_matches, median_error
-
-        # 1. Generate matches for both methods
-        self.matches_1 = self._match_peaks_to_target(1, tolerance=tolerance_ppm)
-        self.matches_2 = self._match_peaks_to_target(2, tolerance=tolerance_ppm)
-
-        # 2. Score both methods
-        score1_count, score1_err = _score_matches(self.matches_1)
-        score2_count, score2_err = _score_matches(self.matches_2)
-
-        # 3. Determine the winner
-        self.peak_finding_both_methods = (score1_count > 0 and score2_count > 0)
-        self.peak_finding_good = ((score1_count > 0 and score1_err < tolerance_ppm) and
-                                  (score2_count > 0 and score2_err < tolerance_ppm))
-        self.peak_finding_ok = (score1_count > 0 or score2_count > 0)
-        self.peak_finding_warning = (score1_count == 0 and score2_count == 0)
-
-
-        if score1_count > score2_count:
-            self.best_matches = self.matches_1.copy()
-        elif score2_count > score1_count:
-            self.best_matches = self.matches_2.copy()
-        else:
-            # If they matched the same number of isotopes, pick the one with better mass accuracy
-            if score1_err <= score2_err:
-                self.best_matches = self.matches_1.copy()
-            else:
-                self.best_matches = self.matches_2.copy()
-
-        # You can drop the 'peak_matches_similar' flag, as we are no longer averaging.
-        return self.best_matches
-
-    def process_ms1_quality(self, ppm_error=10):
-        # do we even have any matches to check?
-        if getattr(self, 'best_matches', None) is None or self.best_matches.empty:
-            print("Warning: matches data is empty. Cannot process MS1 quality.")
-            self.quality_metrics = {
-                "peak_finding_ok": getattr(self, 'peak_finding_ok', False),
-                "peak_finding_warning": getattr(self, 'peak_finding_warning', True),
-                "peak_matches_similar": getattr(self, 'peak_matches_similar', False),
-                "decoy_unmatched": False,
-                "other_peaks": True,
-                "median_error_ppm": np.nan,
-                "quality_pass": False,
-                "overall_pass": False,
-                "final_trapz_area": self.trapz_area,
-                "final_gaussian_params": self.gaussian_params,
-                "final_gaussian_errors": self.gaussian_errors,
-            }
-            return False
-
-        matches = self.best_matches
-
-        # 1. Decoy (M-1) Check
-        decoy = matches[matches["isotopologue"] == "decoy-1"]
-        # We use pd.isna() to correctly check for NaN values
-        decoy_mz_is_nan = pd.isna(decoy["observed_mz"]).any()
-        decoy_abundance_is_zero = (decoy["observed_abundance"] == 0.0).any()
-
-        # Confirm the decoy peak was NOT found
-        if decoy_mz_is_nan and decoy_abundance_is_zero:
-            decoy_unmatched = True
-        else:
-            decoy_unmatched = False
-
-        # 2. Filter out the decoy to evaluate actual targets
-        others = matches[matches["isotopologue"] != "decoy-1"]
-
-        # 3. 'Other Peaks' Flag Check (Warning metric, not a hard fail)
-        other_peaks_flag = bool(others["other_peak_in_window"].any())
-
-        # 4. Mass Accuracy (PPM Error) Check
-        # We drop NaNs so we only calculate the median for isotopes we actually found
-        valid_errors = others["error_ppm"].dropna()
-        if not valid_errors.empty:
-            # Crucial: Use absolute error so +5ppm and -5ppm don't average to 0
-            median_error = np.median(np.abs(valid_errors))
-            quality_pass = bool(median_error < ppm_error)
-        else:
-            median_error = np.nan
-            quality_pass = False
-
-        # 5. Overall Pass Gatekeeper
-        # We require: No decoy found AND mass accuracy within tolerance AND at least two target peak found
-        overall_pass = bool(decoy_unmatched and quality_pass and len(valid_errors) >= 2)
-
-        self.quality_metrics = {
-            "peak_finding_ok": getattr(self, 'peak_finding_ok', True),
-            "peak_finding_warning": getattr(self, 'peak_finding_warning', False),
-            "peak_matches_similar": getattr(self, 'peak_matches_similar', False),
-            "decoy_unmatched": decoy_unmatched,
-            "other_peaks": other_peaks_flag,
-            "median_error_ppm": median_error,
-            "quality_pass": quality_pass,
-            "overall_pass": overall_pass,
-            "final_trapz_area": getattr(self, 'trapz_area', None),
-            "final_gaussian_params": getattr(self, 'gaussian_params', None),
-            "final_gaussian_errors": getattr(self, 'gaussian_errors', None),
-        }
-
-        return overall_pass
 
     def calculate_quality_score(self):
         """
@@ -1499,212 +1545,283 @@ class PeptidePeak:
         self.ms2_matches = pd.DataFrame(ms2_matches_list)
         return self.ms2_matches
 
+    def plot_ms1_eic(self, ax=None, time_window_ecc=(3, 15)):
+        """Plots the Extracted Ion Chromatogram for all isotopologues."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 4))
+        ax.set_title("Extracted Ion Chromatogram", fontsize=12)
 
-    def plot_peak(self, time_window_ecc: tuple=(3, 15)):
-        '''
-        grid 4x4
-        ax 1 is upper two vertical, 3 horizontal wide
-        ax 2 is upper two vertical, 1 horizontal wide
-        ax 3 is lower two vertical, 2 horizontal wide
-        ax 4 is lower two vertical, 2 horizontal wide
+        for name, mz in self.isotopologues.items():
+            if name in self.extracted.columns:
+                ax.plot(self.extracted.index, self.extracted[name], label=f"{name} m/z {mz:.4f}")
 
-        """Plots the MS1 peak with raw, interpolated, and autopique data.
-        First subplot is the extracted ion chromatogram where the corresponding retention time of the peak is highlighted by two vertical dotted lines
-        Second subplot is the extracted chromatogram around the peak apex zoomed in
-        Third subplot is the raw spectrum mz vs int for thr raw data, interpolated data and also autopique data is also plotted but both shifted up by 10% more each of the max intensity for visibility
-        Fourth subplot is the autocorrelation of the autopique filtered data
-        Args:
-            time_window_ecc (tuple): Time window for the ecc to show
-        """
-        '''
-        if self.raw_apex is None or self.raw_apex.empty:
-            print("Warning: raw_apex data is empty. Cannot plot.")
-            return
-        if self.raw_apex_interp is None or self.raw_apex_interp.empty:
-            print("Warning: raw_apex_interp data is empty. Cannot plot.")
-            return
-        if self.raw_apex_autopique is None or self.raw_apex_autopique.empty:
-            print("Warning: raw_apex_autopique data is empty. Cannot plot.")
-            return
+        if self.raw_apex is not None and not self.raw_apex.empty:
+            ax.axvline(self.raw_apex["time"].min(), color="k", linestyle="--", alpha=0.7)
+            ax.axvline(self.raw_apex["time"].max(), color="k", linestyle="--", alpha=0.7)
+
+        ax.set_xlim(time_window_ecc)
+        ax.set_xlabel("Retention Time (min)")
+        ax.set_ylabel("Intensity")
+        ax.legend(prop={"size": 8}, loc="upper right")
+        return ax
+
+    def plot_ms1_zoomed(self, ax=None):
+        """Plots the zoomed EIC area along with the asymmetric Gaussian fit trace."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 4))
+        ax.set_title("Zoomed Extracted Ion Chromatogram", fontsize=12)
+
+        if self.zoomed_extracted is not None and not self.zoomed_extracted.empty:
+            ax.plot(self.zoomed_extracted.index, self.zoomed_extracted["total_intensity"], color="k", label="Total EIC")
+
+        if self.gaussian_params is not None:
+            x_fit = np.linspace(self.zoomed_extracted.index.min(), self.zoomed_extracted.index.max(), 100)
+            # Assumes 'asym_peak' is imported/accessible in your namespace
+            y_fit = asym_peak(x_fit, *self.gaussian_params)
+            ax.plot(x_fit, y_fit, color="red", linestyle="--", label="Fitted Asym Gaussian")
+
+        ax.set_xlabel("Retention Time (min)")
+        ax.set_ylabel("Intensity")
+        ax.legend(prop={"size": 8})
+        return ax
+
+    def plot_ms1_raw(self, ax=None):
+        """Plots the raw profile data."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 4))
+        ax.set_title("Raw Spectrum", fontsize=12)
+        if self.isotopologues:
+            mz_values = list(self.isotopologues.values())
+            ax.set_xlim(min(mz_values) - 1.5, max(mz_values) + 1.5)
+
+        if self.raw_apex is not None and not self.raw_apex.empty:
+            ax.plot(self.raw_apex["mz_array"], self.raw_apex["intensity_array"], label="Raw Data", color="black",
+                    linestyle="--", alpha=0.5)
+        if self.scipy_peaks_1 is not None and not self.scipy_peaks_1.empty:
+            ax.scatter(self.scipy_peaks_1["mz_array_peak"], self.scipy_peaks_1["intensity_array_peak"], color="purple",
+                       marker="x", s=80, label="Scipy Peaks CWT")
+
+        for name, mz in self.isotopologues.items():
+            ax.axvline(mz, color="red", linestyle=":", alpha=0.7)
+
+        ax.set_ylabel("Intensity")
+        ax.legend(prop={"size": 7}, loc="upper right")
+        return ax
+
+
+    def plot_ms1_raw_binned(self, ax=None):
+        """Plots raw profile data against binned histograms and CWT peaks."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 4))
+        ax.set_title("Raw and Binned Spectrum", fontsize=12)
+
+        if self.isotopologues:
+            mz_values = list(self.isotopologues.values())
+            ax.set_xlim(min(mz_values) - 1.5, max(mz_values) + 1.5)
+
+        if self.raw_apex is not None and not self.raw_apex.empty:
+            ax.plot(self.raw_apex["mz_array"], self.raw_apex["intensity_array"], label="Raw Data", color="black",
+                    linestyle="--", alpha=0.5)
+
+        ax.plot(self.mzs_1, self.intensities_1, label="Binned Data", color="blue")
+
+        if self.scipy_peaks_1 is not None and not self.scipy_peaks_1.empty:
+            ax.scatter(self.scipy_peaks_1["mz_array_peak"], self.scipy_peaks_1["intensity_array_peak"], color="purple",
+                       marker="x", s=80, label="Scipy Peaks CWT")
+
+        for name, mz in self.isotopologues.items():
+            ax.axvline(mz, color="red", linestyle=":", alpha=0.7)
+
+        ax.set_ylabel("Intensity")
+        ax.legend(prop={"size": 7}, loc="upper right")
+        return ax
+
+    def plot_ms1_autopique(self, ax=None):
+        """Plots the matched isotopic profiles passing Autopique deconvolution."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 4))
+        ax.set_title("Matched Isotopologues Check", fontsize=12)
+
+        if self.isotopologues:
+            mz_values = list(self.isotopologues.values())
+            ax.set_xlim(min(mz_values) - 1.5, max(mz_values) + 1.5)
+
+        if self.raw_apex is not None and not self.raw_apex.empty:
+            ax.plot(self.raw_apex["mz_array"], self.raw_apex["intensity_array"], label="Raw Data", color="black",
+                    linestyle="--", alpha=0.5)
+
+        ax.plot(self.mzs_2, self.intensities_2, label="Autopique Filtered", color="green")
+
+        if self.scipy_peaks_2 is not None and not self.scipy_peaks_2.empty:
+            ax.scatter(self.scipy_peaks_2["mz_array_peak"], self.scipy_peaks_2["intensity_array_peak"], color="red",
+                       marker="x", s=80, label="Matched Isotopologues")
+
+        if getattr(self, 'autopique_threshold', None) is not None:
+            ax.axhline(self.autopique_threshold, color="orange", linestyle="--", label="Threshold", alpha=0.7)
+
+        for name, mz in self.isotopologues.items():
+            ax.axvline(mz, color="red", linestyle=":", alpha=0.7)
+
+        ax.set_xlabel("m/z")
+        ax.set_ylabel("Intensity")
+        ax.legend(prop={"size": 7}, loc="upper right")
+        return ax
+
+    def plot_ms2_mirrored(self, ax=None):
+        """Generates a head-to-tail mirrored fragmentation layout (Raw vs b/y matches)."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+        ax.set_title("Mirrored MS2 Fragmentation (Raw vs Matched)", fontsize=12)
+        ax.axhline(0, color="gray", linestyle="-", linewidth=0.8, alpha=0.7)
+
+        max_raw_ms2 = 1
+        if self.ms2_data is not None and not self.ms2_data.empty:
+            ax.vlines(self.ms2_data["fragment_mz"], ymin=0, ymax=self.ms2_data["fragment_int"], color="black",
+                      linewidth=0.8, alpha=0.5, label="Raw MS2 Data")
+            max_raw_ms2 = self.ms2_data["fragment_int"].max()
+
+        max_match_int = 1
+        b_ions = pd.DataFrame()
+        y_ions = pd.DataFrame()
+
+        if self.ms2_matches is not None and not self.ms2_matches.empty:
+            b_ions = self.ms2_matches[self.ms2_matches["type"].str.contains("b")].dropna(subset=["observed_mz"])
+            y_ions = self.ms2_matches[self.ms2_matches["type"].str.contains("y")].dropna(subset=["observed_mz"])
+
+            if not b_ions.empty:
+                ax.vlines(b_ions["observed_mz"], ymin=0, ymax=-b_ions["intensity"], color="blue", linewidth=1.2,
+                          label="Matched b-ions")
+            if not y_ions.empty:
+                ax.vlines(y_ions["observed_mz"], ymin=0, ymax=-y_ions["intensity"], color="red", linewidth=1.2,
+                          label="Matched y-ions")
+
+            all_matches = pd.concat([b_ions, y_ions])
+            max_match_int = all_matches["intensity"].max() if not all_matches.empty else 1
+
+            for _, row in b_ions.iterrows():
+                ax.text(row["observed_mz"], -row["intensity"] - (max_match_int * 0.03), f"{row['fragment']}",
+                        color="blue", va="top", ha="center", fontsize=7, rotation=90)
+            for _, row in y_ions.iterrows():
+                ax.text(row["observed_mz"], -row["intensity"] - (max_match_int * 0.03), f"y{row['fragment']}",
+                        color="red", va="top", ha="center", fontsize=7, rotation=90)
+
+        y_limit_abs = max(max_raw_ms2, max_match_int) * 1.15
+        ax.set_ylim(-y_limit_abs, y_limit_abs)
+        ax.set_xlabel("m/z for fragments")
+        ax.set_ylabel("Abundance (Mirrored Intensity)")
+
+        # Safe tick absolute reformatting
+        ax.set_yticks(ax.get_yticks())
+        ax.set_yticklabels([str(int(abs(y))) for y in ax.get_yticks()])
+        ax.legend(loc="upper right", prop={"size": 8})
+        return ax
+
+    def plot_summary_table(self, ax=None):
+        """Renders a clean, boxless background table displaying isotope metrics."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 3))
+        ax.axis("off")
+
         if self.best_matches is None or self.best_matches.empty:
-            print("Warning: matches data is empty. Cannot plot.")
-            return
+            return ax
 
-        fig = plt.figure(constrained_layout=True, figsize=(16, 12))
-        # We define a 3x3 main grid to fill all spaces
+        table_data = self.best_matches.copy()
+        float_cols = ["theoretical_mz", "observed_mz", "error_ppm", "theoretical_abundance", "observed_abundance"]
+        for col in float_cols:
+            if col in table_data.columns:
+                table_data[col] = table_data[col].apply(
+                    lambda x: round(x, 4) if isinstance(x, (float, np.float64)) else x)
+
+        table = ax.table(cellText=table_data.values, colLabels=table_data.columns, cellLoc="center", loc="center")
+        table.auto_set_font_size(False)
+        table.set_fontsize(7)
+        table.scale(1.0, 1.3)
+        return ax
+
+    def plot_peptide_sequence(self, ax=None):
+        """Draws sequence strings showing structural b and y ion fragmentation assignments."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 2))
+        ax.axis("off")
+        ax.set_title("Peptide Sequence with Modifications", fontsize=10)
+
+        # Assumes peptide_parser is accessible in global runtime namespace
+        parsed_modx_seq = peptide_parser.parse(self.target.sequence)
+        seq_length = len(parsed_modx_seq)
+
+        dynamic_fs = 12 if seq_length < 20 else 10 if seq_length < 40 else 8
+        x_positions_peptide = np.linspace(0.1, 0.9, seq_length)
+        x_pos_diff = x_positions_peptide[1] - x_positions_peptide[0] if seq_length > 1 else 0
+
+        y_position_peptide = 0.5
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+
+        for j, aa in enumerate(parsed_modx_seq):
+            ax.text(x_positions_peptide[j], y_position_peptide, aa, fontsize=dynamic_fs, ha="center", va="center",
+                    weight="bold")
+
+        b_ions = pd.DataFrame()
+        y_ions = pd.DataFrame()
+        if self.ms2_matches is not None and not self.ms2_matches.empty:
+            b_ions = self.ms2_matches[self.ms2_matches["type"].str.contains("b")].dropna(subset=["observed_mz"])
+            y_ions = self.ms2_matches[self.ms2_matches["type"].str.contains("y")].dropna(subset=["observed_mz"])
+
+        if not b_ions.empty:
+            for _, row in b_ions.iterrows():
+                frag_pos = int(row["fragment"][1:])
+                if 0 < frag_pos <= len(x_positions_peptide):
+                    x_pos_current = x_positions_peptide[frag_pos - 1]
+                    label_text = f"{row['fragment']} ppm:{round(row.get('error_ppm', 0), 2)}"
+                    ax.text(float(x_pos_current), y_position_peptide + 0.19, label_text, color="blue", fontsize=5,
+                            ha="left", va="bottom", rotation=45)
+                    if frag_pos < len(x_positions_peptide):
+                        ax.plot([x_pos_current + x_pos_diff / 2, x_pos_current + x_pos_diff / 2, x_pos_current],
+                                [y_position_peptide, y_position_peptide + 0.12, y_position_peptide + 0.17],
+                                color="blue", linewidth=0.8)
+
+        if not y_ions.empty:
+            for _, row in y_ions.iterrows():
+                frag_pos = seq_length - int(row["fragment"][1:])
+                if 0 < frag_pos <= len(x_positions_peptide):
+                    x_pos_current = x_positions_peptide[frag_pos - 1]
+                    label_text = f"{row['fragment']} ppm:{round(row.get('error_ppm', 0), 2)}"
+                    ax.text(float(x_pos_current), y_position_peptide - 0.19, label_text, color="red", fontsize=5,
+                            ha="right", va="top", rotation=45)
+                    if frag_pos < len(x_positions_peptide):
+                        ax.plot([x_pos_current - x_pos_diff / 2, x_pos_current - x_pos_diff / 2, x_pos_current],
+                                [y_position_peptide, y_position_peptide - 0.12, y_position_peptide - 0.17], color="red",
+                                linewidth=0.8)
+        return ax
+
+    def plot_peak(self, time_window_ecc=(3, 15)):
+        """The Master compilation layout function. Re-assembles individual panels
+
+        into the complete multi-row dashboard layout.
+        """
+        fig = plt.figure(constrained_layout=True, figsize=(16, 14))
         gs_main = gridspec.GridSpec(4, 2, figure=fig)
         fig.suptitle(f"MS1 Peak Analysis for {self.target.sequence}, z={self.charge} at RT={self.rt:.2f} min",
                      fontsize=16)
 
-        # --- TOP ROW: Chromatograms (1 row, 2 columns) ---
-        ax1 = fig.add_subplot(gs_main[0, 0])  # Left: Extracted Ion Chromatogram
-        ax2 = fig.add_subplot(gs_main[0, 1])  # Right: Zoomed Chromatogram
-        ax1.set_title("Extracted Ion Chromatogram")
-        ax2.set_title("Zoomed Extracted Ion Chromatogram")
+        self.plot_ms1_eic(ax=fig.add_subplot(gs_main[0, 0]), time_window_ecc=time_window_ecc)
+        self.plot_ms1_zoomed(ax=fig.add_subplot(gs_main[0, 1]))
 
-        # Plot 1: Extracted Ion Chromatogram
-        for name, mz in self.isotopologues.items():
-            ax1.plot(self.extracted.index, self.extracted[name], label=f"{name} m/z {mz:.4f}")
-        ax1.axvline(self.raw_apex['time'].min(), color='k', linestyle='--')
-        ax1.axvline(self.raw_apex['time'].max(), color='k', linestyle='--')
-        ax1.set_xlim(time_window_ecc)
-        ax1.legend()
+        ax_raw = fig.add_subplot(gs_main[1, 0])
+        self.plot_ms1_raw_binned(ax=ax_raw)
+        self.plot_ms1_autopique(ax=fig.add_subplot(gs_main[1, 1], sharex=ax_raw))
 
-        # Plot 2: Zoomed Extracted Ion Chromatogram
-        if self.zoomed_extracted is not None and not self.zoomed_extracted.empty:
-            ax2.plot(self.zoomed_extracted.index, self.zoomed_extracted['total_intensity'], color='k')
-        if self.gaussian_params is not None:
-            x_fit = np.linspace(self.zoomed_extracted.index.min(), self.zoomed_extracted.index.max(), 100)
-            y_fit = asym_peak(x_fit, *self.gaussian_params)
-            ax2.plot(x_fit, y_fit, color='red', linestyle='--', label='Fitted Asym Gaussian')
-            ax2.legend()
+        self.plot_ms2_mirrored(ax=fig.add_subplot(gs_main[2:, 0]))
+        self.plot_summary_table(ax=fig.add_subplot(gs_main[2, 1]))
+        self.plot_peptide_sequence(ax=fig.add_subplot(gs_main[3, 1]))
 
-        # --- MIDDLE ROW: MS1 Plots and Table (1 row, 3 columns) ---
-        # We use a single row in the main grid for all MS1-related plots and the table
-        ax3 = fig.add_subplot(gs_main[1, 0])  # Raw/Interpolated
-        ax4 = fig.add_subplot(gs_main[1, 1], sharex=ax3)  # Matched Isotopologues
-        ax5 = fig.add_subplot(gs_main[3, 0])  # Table
-
-        ax3.set_title("Raw and Binned Spectrum")
-        ax4.set_title("Matched Isotopologues")
-
-        # Plot 3: Raw and Scipy Peaks
-        ax3.plot(self.raw_apex['mz_array'], self.raw_apex['intensity_array'], label='Raw Data', color='black', linestyle='--')
-        ax3.plot(self.mzs_1, self.intensities_1, label='Binned Data', color='blue')  # Shifted up by 10% for visibility
-        if self.scipy_peaks_1 is not None and not self.scipy_peaks_1.empty:
-            ax3.scatter(self.scipy_peaks_1['mz_array_peak'], self.scipy_peaks_1['intensity_array_peak'], color='purple', marker='x',
-                    s=100, label='Scipy Peaks CWT')
-        # we plot the predicted isotopologue m/z as vertical dashed lines
-        for name, mz in self.isotopologues.items():
-            ax3.axvline(mz, color='red', linestyle='--', label=f"{name} m/z {mz:.4f}")
-        ax3.legend()
-        # we make the legend text smaller using prop
-        ax3.legend(prop={'size': 6})
-
-        # Plot 4: Autopique peaks
-        ax4.plot(self.raw_apex['mz_array'], self.raw_apex['intensity_array'], label='Raw Data', color='black', linestyle='--')
-        ax4.plot(self.mzs_2, self.intensities_2, label='Autopique Filtered',
-                 color='Green')  # Shifted up by 10% for visibility
-        if self.scipy_peaks_2 is not None and not self.scipy_peaks_2.empty:
-            ax4.scatter(self.scipy_peaks_2['mz_array_peak'], self.scipy_peaks_2['intensity_array_peak'], color='red', marker='x', s=100,
-                    label='Matched Isotopologues')
-        # we plot the autopique threshold as a horizontal dashed line
-        if self.raw_apex_autopique is not None and not self.raw_apex_autopique.empty:
-            threshold = self.autopique_threshold
-            ax4.axhline(threshold, color='orange', linestyle='--', label=f'Autopique Threshold {threshold}')
-
-        for name, mz in self.isotopologues.items():
-            ax4.axvline(mz, color='red', linestyle='--', label=f"{name} m/z {mz:.4f}")
-        ax4.legend()
-        # we make the legend text smaller using prop
-        ax4.legend(prop={'size': 6})
-
-        # we plot a table containing a summary of the matches in ax5,. we plot alln the values from best_matches,
-        # including the isotopologue name, the target m/z, the observed m/z, the error in ppm, the theoretical abundance,
-        # the observed abundance and whether other peaks were in the window
-        table_data = self.best_matches.copy()
-        # we round any floats to 4 decimal places for better display
-        float_cols = ['theoretical_mz', 'observed_mz', 'error_ppm', 'theoretical_abundance', 'observed_abundance']
-        for col in float_cols:
-            if col in table_data.columns:
-                table_data[col] = table_data[col].apply(lambda x: round(x, 4) if isinstance(x, (float, np.float64)) else x)
-
-        ax5.axis('on')
-
-        # we make the table columns different widths
-        table = ax5.table(cellText=table_data.values, colLabels=table_data.columns, cellLoc='center', loc='center')
-        table.auto_set_font_size(False)
-        table.set_fontsize(6)
-        table.scale(1.2, 1.2)
-
-        # --- BOTTOM ROW: MS2 Plots and Peptide Sequence (1 row, 3 columns) ---
-        ax6 = fig.add_subplot(gs_main[2, 0])  # Raw MS2 Data
-        ax7 = fig.add_subplot(gs_main[2, 1], sharex=ax6)  # Matched Fragments
-        ax8 = fig.add_subplot(gs_main[3, 1])  # Peptide Sequence
-
-        ax6.set_title("Raw MS2 Fragmentation Data")
-        ax7.set_title("MS/MS Fragment Matches")
-        ax8.set_title("Peptide Sequence", fontsize=10)
-
-        # Plot 6: Raw MS2 Data
-        if self.ms2_data is not None and not self.ms2_data.empty:
-            ax6.vlines(self.ms2_data['fragment_mz'], ymin=0, ymax=self.ms2_data['fragment_int'], color='black',
-                       label='MS2 Data')
-        # Plot 7: Matched Fragments
-        max_intensity = self.ms2_data['fragment_int'].max() if self.ms2_data is not None and not self.ms2_data.empty else 1
-        if self.ms2_matches is not None and not self.ms2_matches.empty:
-            b_ions = self.ms2_matches[self.ms2_matches['type'].str.contains('b')].copy()
-            y_ions = self.ms2_matches[self.ms2_matches['type'].str.contains('y')].copy()
-            # we get rid of any rows with NaN observed_mz
-            b_ions = b_ions.dropna(subset=['observed_mz'])
-            y_ions = y_ions.dropna(subset=['observed_mz'])
-            # we plot the b ions as blue vlines
-            ax7.vlines(b_ions['observed_mz'], ymin=0, ymax=b_ions['intensity'], color='blue', label='b ions')
-            ax7.vlines(y_ions['observed_mz'], ymin=0, ymax=y_ions['intensity'], color='red', label='y ions')
-            # we plot the ion names
-            for idx, row in b_ions.iterrows():
-                ax7.text(row['observed_mz'], row['intensity'] + max_intensity * 0.02, f"{row['fragment']}", color='blue', va='bottom', ha='center', fontsize=6)
-            for idx, row in y_ions.iterrows():
-                ax7.text(row['observed_mz'], row['intensity'] + max_intensity * 0.02, f"y{row['fragment']}", color='red', va='bottom', ha='center', fontsize=6)
-            ax7.legend()
-        ax6.set_xticks([])
-        ax6.set_ylabel('')
-        ax7.set_xlabel("m/z for fragments")
-        ax7.set_ylabel("Intensity")
-        ax6.set_title("MS2 Fragmentation Data")
-        ax7.set_ylabel("intensity")
-
-        # Plot 8: Peptide Sequence
-        ax8.axis('off')
-        ax8.set_title("Peptide Sequence with Modifications", fontsize=10)
-
-        parsed_modx_seq = peptide_parser.parse(self.target.sequence)
-        # we get the length of the parsed sequence
-        seq_length = len(parsed_modx_seq)
-        x_positions_peptide = np.linspace(0.1, 0.9, seq_length)
-        x_position_diff = x_positions_peptide[1] - x_positions_peptide[0]
-        y_position_peptide = 0.5
-        ax8.set_ylim(0, 1)
-
-        for i, aa in enumerate(parsed_modx_seq):
-            ax8.text(x_positions_peptide[i], y_position_peptide, aa, fontsize=12, ha='center', va='center')
-
-        if self.ms2_data is not None and not self.ms2_data.empty:
-            # Check for ms2_matches and plot them
-            if b_ions is not None and not b_ions.empty and y_ions is not None and not y_ions.empty:
-                for idx, row in b_ions.iterrows():
-                    frag_pos = int(row['fragment'][1:])
-                    x_position_current = x_positions_peptide[frag_pos - 1]
-                    # we plot the text above the corresponding amino acid
-                    ax8.text(float(x_position_current), y_position_peptide + 0.2, f"{row['fragment']} ppm:{round(row['error_ppm'],2)}", color='blue', fontsize=6, ha='left', va='bottom', rotation=45)
-                    # we plot a line starting at the amino acid and going up to the text, and have it vertical and then angled
-                    lines_x = [x_positions_peptide[frag_pos - 1] + x_position_diff / 2, x_positions_peptide[frag_pos - 1] + x_position_diff / 2, x_positions_peptide[frag_pos - 1]]
-                    lines_y = [y_position_peptide, y_position_peptide + 0.08, y_position_peptide + 0.12]
-                    ax8.plot(lines_x, lines_y, color='blue', linewidth=0.5)
-
-                for idx, row in y_ions.iterrows():
-                    frag_pos = seq_length - int(row['fragment'][1:]) + 1
-                    x_position_current = x_positions_peptide[frag_pos - 1]
-                    # we plot the text above the corresponding amino acid
-                    ax8.text(float(x_position_current), y_position_peptide - 0.2,f"{row['fragment']} ppm:{round(row['error_ppm'],2)}", color='red', fontsize=6, ha='right', va='top', rotation=45)
-                    # we plot a line starting at the amino acid and going up to the text, and
-                    lines_x = [x_positions_peptide[frag_pos - 1] - x_position_diff / 2, x_positions_peptide[frag_pos - 1] - x_position_diff / 2, x_positions_peptide[frag_pos - 1]]
-                    lines_y = [y_position_peptide, y_position_peptide - 0.08, y_position_peptide - 0.12]
-                    ax8.plot(lines_x, lines_y, color='red', linewidth=0.5)
-            else:
-                print("Warning: ms2_matches data is empty. Cannot plot fragments.")
-
-
-
-        plt.tight_layout()
         plt.show()
-
 
     def __repr__(self):
         return f"<PeptidePeak target='{self.target.sequence}' charge={self.charge} rt={self.rt:.2f}min>"
 
 # Assume the other classes (MSExperiment, TargetPeptide, LCMSPeak, etc.) are defined as before.
-
+'''
 class AnalysisResults:
     """
     A container for storing, saving, and loading all PeptidePeak results.
@@ -2036,7 +2153,109 @@ class AnalysisResults:
                 break # Exit the loop for this replicate
 
         plt.ioff() # Turn off interactive mode
+'''
 
+
+class AnalysisResults:
+    def __init__(self, experiment):
+        self.experiment = experiment
+        self.found_peaks = {}  # {target: [list of PeptidePeak]}
+        self.selected_peaks = {}
+        self.summary_df = None
+
+    def expand_and_initialize_targets(self, mod_dict, verbose=False):
+        """Expands experiment targets with modified variants and creates stubs for missing features."""
+        # 1. Expand modification targets
+        mod_target_objects = []
+        for mod_seq, mods in zip(self.experiment.modified_sequences, self.experiment.modifications):
+            mod_seq_clean = mod_seq.replace('*', '')
+            # Generate targets
+            mod_peptides = generate_targets(
+                peptide_sequence=mod_seq_clean, digestion=self.experiment.digestion,
+                mod_dict=mod_dict, core_start=self.experiment.core_start,
+                core_end=self.experiment.core_end
+            )
+
+            mod_desc = {mod[0]: mod[1] for mod in mods} if isinstance(mods, list) else {mods[0]: mods[1]}
+
+            for tgt_coords in mod_peptides:
+                tgt_obj = TargetPeptide(
+                    sequence=tgt_coords[1], mod_dict=mod_dict,
+                    fragment_cut=(tgt_coords[0], tgt_coords[2]),
+                    modifications=mod_desc
+                )
+                tgt_obj.get_isotopologues(mod_dict=aa_comp_custom)
+                tgt_obj.generate_fragments(types=['b', 'y'], max_charge=1)
+                mod_target_objects.append(tgt_obj)
+
+        self.experiment.target_peptides += mod_target_objects
+
+    def add_peaks(self, target, peaks: list):
+        """Adds peaks and automatically creates stubs for targets without detections."""
+        if target not in self.found_peaks:
+            self.found_peaks[target] = []
+        self.found_peaks[target].extend(peaks)
+
+    def remove_duplicate_peaks(self):
+        """De-duplicates overlapping peaks, keeping the largest/parent peak."""
+        for target, peaks in self.found_peaks.items():
+            if len(peaks) < 2: continue
+
+            # Sort by area descending (largest first)
+            sorted_peaks = sorted(peaks, key=lambda x: getattr(x, 'trapz_area', 0), reverse=True)
+            kept = []
+
+            for p in sorted_peaks:
+                # Keep if not entirely contained within an already kept peak
+                if not any((p.rt_start >= k.rt_start and p.rt_end <= k.rt_end) for k in kept):
+                    kept.append(p)
+            self.found_peaks[target] = kept
+
+    def organize_by_structure(self):
+        """Groups peaks into hierarchical structures by Cut -> Charge -> Mod."""
+        self.remove_duplicate_peaks()
+
+        # Structure: {cut: {charge: {mod_key: [peaks]}}}
+        organized = {}
+
+        for target, peaks in self.found_peaks.items():
+            cut = target.fragment_cut
+            charge = peaks[0].charge if peaks else 0
+            mod_key = str(target.modifications)
+
+            organized.setdefault(cut, {}).setdefault(charge, {}).setdefault(mod_key, [])
+
+            for p in peaks:
+                # Add stats: count of peaks found in this grouping
+                p.group_peak_count = len(peaks)
+                organized[cut][charge][mod_key].append(p)
+
+        return organized
+
+    def select_best_peaks(self):
+        """Refined filtering logic using the logic requested."""
+        self.remove_duplicate_peaks()
+        # ... [Keep your existing filtering logic here] ...
+        pass
+
+    def summarize(self) -> pd.DataFrame:
+        """Flattens the organized structure into a robust DataFrame."""
+        org = self.organize_by_structure()
+        records = []
+
+        for cut, charges in org.items():
+            for charge, mods in charges.items():
+                for mod_key, peaks in mods.items():
+                    records.append({
+                        'fragment_cut': cut,
+                        'charge': charge,
+                        'modification': mod_key,
+                        'peak_count': len(peaks),
+                        'max_area': max([p.trapz_area for p in peaks]),
+                        'peaks': peaks
+                    })
+        self.summary_df = pd.DataFrame(records)
+        return self.summary_df
 
 class GroupedExperiments:
     def __init__(self, *analysis_results):
@@ -2052,7 +2271,6 @@ class GroupedExperiments:
                 state_key = f"{t.sequence} {t.modifications}"
                 theoretical_targets[state_key] = t
         return theoretical_targets
-
 
     def generate_all_reports(self, output_dir: Path, plot_mz: bool = True, plot_ms2: bool = False):
         output_dir = Path(output_dir)
@@ -2211,7 +2429,6 @@ class GroupedExperiments:
                         if is_good_quality and is_significant_area:
                             group['group_pass'] = True  # If it's a winning group, it's a passing group.
                             winning_groups.append(group)
-
 
                     # Now that all winning groups are selected, add their peaks to the final lists
                     for group in winning_groups:
