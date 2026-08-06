@@ -15,7 +15,8 @@ from pyteomics import mzml, mass
 
 from classes_spectrometry import *
 from modification_dictionary import aa_comp_custom
-from pipeline_functions import *
+import peptide_functions as peptide_functions
+
 
 parser = argparse.ArgumentParser(
     description='call the main script for RiPP modification analysis on a specified input excel file or csv file')
@@ -69,7 +70,7 @@ def main(input_file, verbose, override, renew, minimum_intensity, mod_dict):
         except FileNotFoundError as e:
             print(f"\nWarning: Skipping row {index+1} ({row['sample_id']}) because a file was not found: {e}\n")
             continue
-            
+
         if verbose:
             print(f"MassSpectrum object created for {experiment.sample_id} - {experiment.experiment_id}")
             print(f"Loading spectrum data for {experiment.sample_id} - {experiment.experiment_id}")
@@ -88,7 +89,7 @@ def main(input_file, verbose, override, renew, minimum_intensity, mod_dict):
         # we sanitize any stop codons
         experiment.peptide_sequence = experiment.peptide_sequence.replace('*', '')
         # we generate the peptide targets for the unmodified peptide
-        peptides = generate_targets(peptide_sequence=experiment.peptide_sequence, digestion=experiment.digestion, mod_dict=mod_dict,
+        peptides = peptide_functions.generate_targets(peptide_sequence=experiment.peptide_sequence, digestion=experiment.digestion, mod_dict=mod_dict,
                                     missed_cleavages=1, min_length=6, max_length=30, core_only=True, core_start=experiment.core_start, core_end=experiment.core_end)
         if verbose:
             print(f"Peptide Targets from {experiment.peptide_sequence}:\n{peptides}")
@@ -110,7 +111,7 @@ def main(input_file, verbose, override, renew, minimum_intensity, mod_dict):
         # we check if modified_sequence is present as an attribute of experiment, if yes it's either a list or a string
         if hasattr(experiment, 'modified_sequences'):
             mod_seq_input = experiment.modified_sequences
-            
+
             # Ensure input is a list of strings
             if isinstance(mod_seq_input, str):
                 # Split comma-separated strings, handling potential spaces
@@ -120,7 +121,7 @@ def main(input_file, verbose, override, renew, minimum_intensity, mod_dict):
             else:
                 print(f"modified_sequence must be a string or a list of strings")
                 sys.exit(1)
-            
+
             # Sanitize all sequences in the list
             modified_sequences = [seq.strip().replace('*', '') for seq in sequences_list]
 
@@ -151,7 +152,7 @@ def main(input_file, verbose, override, renew, minimum_intensity, mod_dict):
             for mod_seq, mods in zip(experiment.modified_sequences, experiment.modifications):
                 print(f"Processing modified sequence: {mod_seq} with modifications: {mods}")
                 mod_seq = mod_seq.replace('*', '')
-                mod_peptides = generate_targets(peptide_sequence=mod_seq, digestion=experiment.digestion, mod_dict=mod_dict,
+                mod_peptides = peptide_functions.generate_targets(peptide_sequence=mod_seq, digestion=experiment.digestion, mod_dict=mod_dict,
                                                 missed_cleavages=1, min_length=6, max_length=30, core_only=True, core_start=experiment.core_start, core_end=experiment.core_end)
                 if verbose:
                     print(f"Modified Peptide Targets from {mod_seq}:\n{mod_peptides}")

@@ -7,6 +7,7 @@ aa_comp_custom["dhA"] = mass.Composition({'C': 3, 'H': 3, 'N': 1, 'O': 1})
 aa_comp_custom["x"] = mass.Composition({'C': 1, 'O': 1})
 aa_comp_custom["xdh"] = mass.Composition({'C': 1, 'O': 1, 'H': -2})
 aa_comp_custom["xdhA"] = mass.Composition({'C': 4, 'H': 3, 'N': 1, 'O': 2})
+aa_comp_custom["xdhB"] = mass.Composition({'C': 5, 'H': 5, 'N': 1, 'O': 2})
 aa_comp_custom["c10ac"] = mass.Composition({'C': 10, 'H': 18, 'O': 1})
 aa_comp_custom["c12ac"] = mass.Composition({'C': 12, 'H': 22, 'O': 1})
 

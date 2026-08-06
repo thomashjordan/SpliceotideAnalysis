@@ -3,32 +3,44 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import matplotlib
-matplotlib.use('Qt5Agg') # Or 'TkAgg' if you don't have PyQt installed
+
+# Set non-interactive or interactive backend as needed
+matplotlib.use('Qt5Agg')  # Or 'TkAgg' if PyQt is not available
 import matplotlib.pyplot as plt
 
 # Local project imports
-# This assumes the script is run from the project's root directory.
-from pipeline_functions import run_analysis_for_group
+from pipeline_functions import run_new_analysis_for_group
+
 
 def load_and_group_samples(excel_path: Path) -> pd.core.groupby.DataFrameGroupBy:
     """Loads the sample sheet from an Excel file and groups it for processing."""
     if not excel_path.exists():
+        print(f"ERROR: Input Excel file not found at: {excel_path}")
         raise FileNotFoundError(f"Input Excel file not found at: {excel_path}")
 
+    print(f"Loading samples from: {excel_path}")
     df_samples = pd.read_excel(excel_path)
 
-    # Group by the unique experimental conditions to process replicates together
-    required_grouping_cols = ['experiment_id', 'precursor_plasmid', 'maturase_name']
+    required_grouping_cols = [
+        'experiment_id',
+        'precursor_plasmid',
+        'maturase_name',
+        'maturase_plasmid',
+        'expression_temperature',
+        'digestion'
+    ]
+
     for col in required_grouping_cols:
         if col not in df_samples.columns:
             raise ValueError(f"Missing required grouping column in Excel file: '{col}'")
 
+    # Grouping across all 6 metadata attributes ensures group_info is a 6-value tuple
     grouped = df_samples.groupby(required_grouping_cols)
     return grouped
 
 
 def main():
-    """Main function to parse arguments and run the plate analysis pipeline."""
+    """Main function to parse CLI arguments and run the LC-MS/MS peak picking pipeline."""
     parser = argparse.ArgumentParser(
         description="Run grouped LC-MS/MS analysis pipeline from pre-processed experiment files."
     )
@@ -42,7 +54,7 @@ def main():
         "-o", "--output_dir",
         required=True,
         type=Path,
-        help="Path to the main output directory where all results, reports, and logs will be saved."
+        help="Path to the main output directory where all final group analysis files will be saved."
     )
     parser.add_argument(
         "--force_reload",
@@ -52,35 +64,58 @@ def main():
     parser.add_argument(
         "--force_reanalyze",
         action="store_true",
-        help="If set, forces re-running of the peak picking and scoring, ignoring cached analysis results."
+        help="If set, forces re-running of peak picking and scoring, ignoring cached analysis results."
     )
     parser.add_argument(
         "--manual_review",
         action="store_true",
-        help="If set, activates interactive manual review mode for each replicate, showing plots for user validation."
+        help="If set, activates interactive manual review mode for each replicate."
     )
     args = parser.parse_args()
 
     try:
-        grouped_samples = load_and_group_samples(args.input_excel)
+        # Ensure root output directory exists
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
+        grouped_samples = load_and_group_samples(args.input_excel)
         total_groups = len(grouped_samples)
+
+        print(f"Found {total_groups} distinct experimental groups to process.")
+
         for i, (group_info, group_df) in enumerate(grouped_samples):
-            print(f"--- Processing Group {i + 1}/{total_groups} ---")
-            # The core logic is now in a separate function for clarity
-            run_analysis_for_group(
+            # Format readable group display string
+            group_label = " | ".join([str(val) for val in group_info])
+            print(f"\n==================================================")
+            print(f"Processing Group {i + 1}/{total_groups}: {group_label}")
+            print(f"Replicates in group: {len(group_df)}")
+            print(f"==================================================")
+
+            # Call core driver with aligned keyword arguments
+            cohort_results = run_new_analysis_for_group(
                 group_info=group_info,
                 group_df=group_df,
-                main_output_dir=args.output_dir,
+                report_output_dir=args.output_dir,  # Aligned parameter name
                 force_reload=args.force_reload,
                 manual_review=args.manual_review,
                 force_reanalyze=args.force_reanalyze
             )
 
-        print("--- Pipeline finished successfully! ---")
+            # Terminal diagnostic printout upon group completion
+            if cohort_results is not None:
+                _, df_summary = cohort_results.generate_modification_state_matrix()
+                if not df_summary.empty:
+                    print("\n--- Group Summary Overview ---")
+                    cols_to_show = [c for c in ['fragment_cut', 'charge', 'modification',
+                                              'avg_retention_time', 'avg_relative_area',
+                                              'cohort_detection_frequency'] if c in df_summary.columns]
+                    print(df_summary[cols_to_show].to_string(index=False))
+
+        print("\n--- Pipeline finished successfully! ---")
 
     except Exception as e:
-        print(f"A critical error stopped the pipeline: {e}")
+        print(f"\nA critical error stopped the pipeline: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
