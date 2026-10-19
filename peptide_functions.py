@@ -1,3 +1,7 @@
+"""Stateless helpers: in-silico digestion of precursor sequences into target fragments
+(``generate_targets``), uneven-grid interpolation of EIC traces, the asymmetric peak model used for
+fitting, and consensus retention-time window selection across replicates.
+"""
 import numpy as np
 import pandas as pd
 import scipy as sp

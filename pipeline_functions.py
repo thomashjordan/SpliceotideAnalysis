@@ -1,3 +1,11 @@
+"""Core automated peak-picking pipeline (driven by peak_picking_pipeline.py).
+
+For each experimental group: extract per-replicate EICs for every target/charge, find candidate
+peaks, cluster them across replicates with DBSCAN, build and score PeptidePeak objects, add empty
+"stub" peaks where a replicate shows nothing, and return a ReplicateGroupResults cohort.
+``pipeline_find_and_score_peak`` re-runs the single-peak scoring for a user-drawn RT window and is
+used by the interactive review dashboard.
+"""
 import sys
 import os
 import pickle
@@ -15,6 +23,12 @@ from modification_dictionary import aa_comp_custom
 from analysis_containers import AnalysisResults, ReplicateGroupResults
 from classes_spectrometry import MSExperiment, MassSpectrum
 from peptide_classes import TargetPeptide, PeptideFragment, PeptidePeak
+
+
+class NoRawApexError(ValueError):
+    """Raised when a requested RT window holds no raw MS1 signal at the requested charge, so no
+    meaningful PeptidePeak can be built from it."""
+
 
 def extract_eic_matrices(spectra: list, target_peptide, mz_range: list, rt_range: list, filtered: bool) -> list:
     """Extracts and isolates Extracted Ion Chromatograms (EICs) across all samples
@@ -171,7 +185,7 @@ def process_and_group_all_replicates(replicate_chromatograms: list, target_pepti
             if len(charge_chromatogram) < 10:
                 continue
 
-            # FIX: Extract true physical replicate index before dropping metadata column via pivot
+            # Extract true physical replicate index before dropping metadata column via pivot
             real_rep_idx = int(charge_chromatogram['rep_idx'].iloc[0])
 
             pivot_df = charge_chromatogram.pivot_table(
@@ -202,7 +216,7 @@ def process_and_group_all_replicates(replicate_chromatograms: list, target_pepti
             max_idx = len(interp_df.index) - 1
 
             for peak in single_rep_peaks:
-                # FIX: Convert integer position indices (ips) to actual retention time values
+                # Convert integer position indices (ips) to actual retention time values
                 # before passing them out of this function's scope.
                 rt_start_index = np.clip(int(round(peak["left_ips"])), 0, max_idx)
                 rt_end_index = np.clip(int(round(peak["right_ips"])), 0, max_idx)
@@ -222,7 +236,7 @@ def process_and_group_all_replicates(replicate_chromatograms: list, target_pepti
                 final_rt_end = min(rt_end_original, peak_center_rt + max_half_width)
 
                 all_validated_features.append({
-                    "rep_idx": real_rep_idx,  # FIX: Pass true array coordinate onward
+                    "rep_idx": real_rep_idx,  # Pass true array coordinate onward
                     "charge": int(charge),
                     "rt": peak["rt"],
                     "rt_start": final_rt_start,
@@ -261,7 +275,7 @@ def process_and_group_all_replicates(replicate_chromatograms: list, target_pepti
                 cluster_id = f"charge_{charge}_cluster_{label}"
                 grouped_clusters[cluster_id] = cluster_rows.to_dict(orient='records')
             else:
-                # FIX: Added enumeration identifier to prevent name collisions during mapping
+                # Added enumeration identifier to prevent name collisions during mapping
                 for fb_idx, (_, row) in enumerate(cluster_rows.iterrows()):
                     grouped_clusters[f"charge_{charge}_noise_fallback_{row['rep_idx']}_{fb_idx}"] = [row.to_dict()]
 
@@ -383,7 +397,13 @@ def pipeline_find_and_score_peak(experiment, spectrum, target, charge: int, rt_s
         )
         full_eic = full_eic_list[0] if full_eic_list else pd.DataFrame()
 
-    window_slice = full_eic[full_eic['time'].between(rt_start, rt_end)] if not full_eic.empty else pd.DataFrame()
+    # The apex must be located in *this charge's* trace only. full_eic spans every charge state
+    # the compound chromatogram swept, so an unrestricted idxmax happily pins the apex to a
+    # neighbouring charge state's maximum -- a retention time where this charge may have nothing.
+    charge_eic = full_eic[full_eic['charge'] == charge] if (
+        not full_eic.empty and 'charge' in full_eic.columns) else full_eic
+
+    window_slice = charge_eic[charge_eic['time'].between(rt_start, rt_end)] if not charge_eic.empty else pd.DataFrame()
     if not window_slice.empty and window_slice['intensity_array'].max() > 0:
         apex_time = float(window_slice.loc[window_slice['intensity_array'].idxmax(), 'time'])
     else:
@@ -394,6 +414,17 @@ def pipeline_find_and_score_peak(experiment, spectrum, target, charge: int, rt_s
         rt_range=[apex_time - apex_rt_window, apex_time + apex_rt_window],
         filtered=False
     )
+
+    # Mirrors the guard run_peak_picking_pipeline's Step C applies before building a peak. Without
+    # it a peak with no MS1 signal whatsoever at this charge is still constructed, scored (against
+    # nothing), rendered with a blank raw m/z panel and -- in the review dashboard -- saved into
+    # selected_peaks as if it were a real detection.
+    if raw_apex_data is None or raw_apex_data.empty:
+        raise NoRawApexError(
+            f"No raw MS1 signal for charge +{charge} in m/z {mz_min:.3f}-{mz_max:.3f} at RT "
+            f"{apex_time:.3f} min (window {rt_start:.3f}-{rt_end:.3f}). The EIC in this window "
+            f"belongs to a different charge state."
+        )
 
     ms2_list = []
     for m_iso in mass_mono:
@@ -446,7 +477,7 @@ def generate_placeholder_stubs(real_peaks: list, experiments: list, spectra: lis
             spectrum = spectra[i]  # Fetch the matching spectral data container
             for charge in relevant_charges:
                 if (target, experiment.spectrum_id, charge) not in presence_map:
-                    # FIX: Pass the spectrum explicitly to bypass the experiment attribute error
+                    # Pass the spectrum explicitly to bypass the experiment attribute error
                     stub = PeptidePeak.create_stub(
                         experiment,
                         target,
@@ -506,8 +537,8 @@ def run_new_analysis_for_group(group_info: tuple,
         row_dict = row.to_dict()
         exp_pkl_path = None
 
-        # FIX: Added 'output_folder_name' to the list of keys to search for.
-        # This is the key used in your Excel file and MSExperiment class.
+        # Sample-sheet columns that may point at the per-sample output folder / experiment pickle.
+        # 'output_folder_name' is the one used by the sample sheets and MSExperiment.
         path_keys = ['output_folder_name', 'output_path', 'output_dir',
                      'experiment_pkl_path', 'output_file', 'experiment_path']
 

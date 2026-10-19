@@ -1,9 +1,22 @@
+"""Raw LC-MS data containers.
+
+* MassSpectrum   -- one .mzML run. ``load()`` parses MS1/MS2 scans with pyteomics, applies a local
+                    median + MAD noise filter to MS1, and caches the frames as pickles next to the
+                    sample's outputs so later runs skip the (slow) mzML parse.
+* MSExperiment   -- metadata for one sample: a row of the sample sheet (see README.md) plus
+                    derived paths (``mzml_path``, ``output_path``) and its ``target_peptides``.
+* to_long_path() -- makes deep Windows paths (> MAX_PATH) usable with open()/exists().
+
+NOTE: saved result pickles reference these classes by module path, so do not rename/move this
+module without providing an unpickling shim.
+"""
 import os
 import pickle as pkl
 import gzip
 import pandas as pd
 import numpy as np
 import pyteomics as pyteomics
+import pyteomics.mzml  # `import pyteomics` does NOT auto-import the mzml submodule; _parse_mzml needs it
 import warnings
 from pathlib import Path  # For better path management
 
@@ -11,6 +24,33 @@ import scipy as sp  # For MAD in _apply_scan_filter
 # Import all peptide classes to allow unpickling of older MSExperiment objects
 # that were saved when these classes were defined in this module.
 from peptide_classes import TargetPeptide, PeptideFragment, PeptidePeak
+
+
+def to_long_path(path) -> str:
+    """Return a filesystem path safe to hand to open()/exists()/pandas/pyteomics even when it is
+    very long.
+
+    Windows' default Win32 API caps paths at 260 characters (MAX_PATH); beyond that, os.path.exists
+    quietly returns False and open() raises FileNotFoundError even though the file is really there
+    (e.g. result files buried under a deep project tree). Prefixing an ABSOLUTE, backslash-separated
+    path with the extended-length marker ``\\\\?\\`` lifts that limit.
+
+    This is applied only when it is actually needed and safe:
+      * no-op off Windows,
+      * no-op for a path already carrying the ``\\\\?\\`` prefix,
+      * no-op for comfortably short paths (left byte-for-byte unchanged, so libraries that don't
+        understand the prefix -- and short paths never need it anyway -- are unaffected).
+    UNC paths (``\\\\server\\share``) get the ``\\\\?\\UNC\\`` form. Always returns a str.
+    """
+    s = os.fspath(path)
+    if os.name != "nt" or s.startswith("\\\\?\\"):
+        return s
+    ab = os.path.abspath(s)
+    if len(ab) < 250:                       # short enough that MAX_PATH is not a concern
+        return s
+    if ab.startswith("\\\\"):               # UNC: \\server\share -> \\?\UNC\server\share
+        return "\\\\?\\UNC\\" + ab[2:]
+    return "\\\\?\\" + ab
 
 
 class MassSpectrum:
@@ -31,6 +71,12 @@ class MassSpectrum:
         self.ms1: pd.DataFrame | None = None
         self.ms2: pd.DataFrame | None = None
         self.ms1_filtered: pd.DataFrame | None = None
+
+        # Lazily built m/z-sorted views of ms1/ms1_filtered, keyed by "raw"/"filtered". Every EIC
+        # and raw-apex query is a narrow m/z slice, and scanning the full ~14M-row long-form frame
+        # per query was where essentially all of the pipeline's runtime went. Sorting once (~0.2 s)
+        # turns each subsequent query into two np.searchsorted calls.
+        self._mz_index_cache: dict = {}
 
         # Define paths to the cache files
         self._ms1_cache_path = self.output_path / f"{self.spectrum_id}_ms1.pkl"
@@ -68,9 +114,9 @@ class MassSpectrum:
     def _cache_exists(self) -> bool:
         """Checks if all necessary cache files exist."""
         return all([
-            self._ms1_cache_path.exists(),
-            self._ms2_cache_path.exists(),
-            self._ms1_filtered_cache_path.exists()
+            os.path.exists(to_long_path(self._ms1_cache_path)),
+            os.path.exists(to_long_path(self._ms2_cache_path)),
+            os.path.exists(to_long_path(self._ms1_filtered_cache_path))
         ])
 
     def _load_from_cache(self) -> bool:
@@ -78,9 +124,9 @@ class MassSpectrum:
         if not self._cache_exists():
             return False
         try:
-            self.ms1 = pd.read_pickle(self._ms1_cache_path)
-            self.ms2 = pd.read_pickle(self._ms2_cache_path)
-            self.ms1_filtered = pd.read_pickle(self._ms1_filtered_cache_path)
+            self.ms1 = pd.read_pickle(to_long_path(self._ms1_cache_path))
+            self.ms2 = pd.read_pickle(to_long_path(self._ms2_cache_path))
+            self.ms1_filtered = pd.read_pickle(to_long_path(self._ms1_filtered_cache_path))
             return True
         except Exception as e:
             print(f"Error loading from cache: {e}")
@@ -89,26 +135,24 @@ class MassSpectrum:
     def _save_to_cache(self):
         """Saves the processed dataframes as pickle files."""
         if self.ms1 is not None:
-            self.ms1.to_pickle(self._ms1_cache_path)
+            self.ms1.to_pickle(to_long_path(self._ms1_cache_path))
         if self.ms2 is not None:
-            self.ms2.to_pickle(self._ms2_cache_path)
+            self.ms2.to_pickle(to_long_path(self._ms2_cache_path))
         if self.ms1_filtered is not None:
-            self.ms1_filtered.to_pickle(self._ms1_filtered_cache_path)
+            self.ms1_filtered.to_pickle(to_long_path(self._ms1_filtered_cache_path))
 
     def _parse_mzml(self, minimum_intensity: float, rt_range: tuple | None):
         """Reads the .mzML file and extracts MS1 and MS2 data."""
-        if not self.mzml_path.is_file():
+        if not os.path.isfile(to_long_path(self.mzml_path)):
             raise FileNotFoundError(f"The file {self.mzml_path} does not exist.")
 
-        # Your logic for parsing the .mzML file remains here.
-        # It's already quite good. Minor adjustments:
-        # - Using with-statement for the file
-        # - More specific error handling
+        # Stream the file once, splitting scans by MS level: MS1 scans become long-form
+        # (time, mz, intensity) rows; MS2 scans keep their precursor info + fragment arrays.
 
         ms1_scans = []
         ms2_scans = []
 
-        reader = pyteomics.mzml.read(str(self.mzml_path))  # pymzml requires a string
+        reader = pyteomics.mzml.read(to_long_path(self.mzml_path))  # pymzml requires a string (long-path-safe)
         for spectrum in reader:
             try:
                 if spectrum['ms level'] == 1:
@@ -158,7 +202,8 @@ class MassSpectrum:
             self.ms2 = pd.DataFrame(ms2_scans).explode(['fragment_mz', 'fragment_int']).dropna()
 
     def _apply_scan_filter(self, time_window, mz_range, mz_window, mad_factor):
-        """Your filter function. The code has been adopted here without changes."""
+        """Local-noise filter for MS1: bins the data into (time_window x mz_window) cells and keeps
+        only points whose intensity exceeds that cell's median + mad_factor * MAD."""
         if self.ms1 is None or self.ms1.empty:
             print("Warning: MS1 data is empty. Cannot apply filter.")
             return pd.DataFrame()  # Return empty DataFrame
@@ -175,8 +220,7 @@ class MassSpectrum:
             (self.ms1['mz_array'] >= min_mz) & (self.ms1['mz_array'] <= max_mz)
             ].copy()
 
-        # ... (the rest of your filter logic remains the same here) ...
-        # Just as an example of how it would continue:
+        # Grid of (time, m/z) cells over which the local noise level is estimated.
         time_edges = np.arange(min_time, max_time + time_window, time_window)
         mz_edges = np.arange(min_mz, max_mz + mz_window, mz_window)
 
@@ -189,28 +233,98 @@ class MassSpectrum:
         time_indices_filtered = np.searchsorted(time_edges_extended, ms1_filtered['time'], side='right') - 1
         mz_indices_filtered = np.searchsorted(mz_edges_extended, ms1_filtered['mz_array'], side='right') - 1
 
-        # Calculate cutoff values for each window
-        median_intensity = np.array([np.median(
-            ms1_filtered['intensity_array'][(time_indices_filtered == i) & (mz_indices_filtered == j)]) if len(
-            ms1_filtered['intensity_array'][(time_indices_filtered == i) & (mz_indices_filtered == j)]) > 0 else 0
-                                     for i in range(len(time_edges))
-                                     for j in range(len(mz_edges))])
-        mad_intensity = np.array([sp.stats.median_abs_deviation(
-            ms1_filtered['intensity_array'][(time_indices_filtered == i) & (mz_indices_filtered == j)]) if len(
-            ms1_filtered['intensity_array'][(time_indices_filtered == i) & (mz_indices_filtered == j)]) > 0 else 0
-                                  for i in range(len(time_edges))
-                                  for j in range(len(mz_edges))])
+        # Calculate cutoff values for each window.
+        #
+        # This used to be a pair of nested list comprehensions that, for every one of the
+        # len(time_edges) x len(mz_edges) cells, boolean-masked the *entire* frame twice (once for
+        # the median, once for the MAD). On a real file that is ~2000 cells x 2 passes x ~14M rows,
+        # i.e. tens of billions of element comparisons per mzML. The grouped form below computes
+        # exactly the same numbers -- per-cell median, and MAD as median(|x - median|), which is
+        # what scipy's median_abs_deviation returns at its default scale=1.0 -- in two vectorised
+        # passes instead.
+        n_time, n_mz = len(time_edges), len(mz_edges)
+        intensities = ms1_filtered['intensity_array'].to_numpy()
+
+        cell_ids = time_indices_filtered * n_mz + mz_indices_filtered
+        in_grid = (time_indices_filtered >= 0) & (time_indices_filtered < n_time) & \
+                  (mz_indices_filtered >= 0) & (mz_indices_filtered < n_mz)
+
+        median_intensity = np.zeros(n_time * n_mz)
+        mad_intensity = np.zeros(n_time * n_mz)
+
+        if np.any(in_grid):
+            cells = pd.Series(intensities[in_grid], index=pd.Index(cell_ids[in_grid], name='cell'))
+            per_cell_median = cells.groupby(level='cell').median()
+            # Broadcast each cell's median back onto its rows so the MAD is a second grouped median
+            # over absolute deviations, rather than a Python-level call per cell.
+            abs_dev = (cells - per_cell_median.reindex(cells.index).to_numpy()).abs()
+            per_cell_mad = abs_dev.groupby(level='cell').median()
+
+            median_intensity[per_cell_median.index.to_numpy()] = per_cell_median.to_numpy()
+            mad_intensity[per_cell_mad.index.to_numpy()] = per_cell_mad.to_numpy()
 
         # Compute cutoff
         cutoff = median_intensity + (mad_factor * mad_intensity)
         # Reshape cutoff into a 2-dimensional array
-        cutoff = cutoff.reshape(len(time_edges), len(mz_edges))
+        cutoff = cutoff.reshape(n_time, n_mz)
 
         # Calculate boolean mask for points below cutoff
         mask = ms1_filtered['intensity_array'] < cutoff[time_indices_filtered, mz_indices_filtered]
 
         ms1_filtered = ms1_filtered[~mask]
         return ms1_filtered
+
+    def _get_mz_index(self, filtered: bool):
+        """Returns (mz_sorted, time_sorted, intensity_sorted) for the requested source, building
+        and caching the m/z-sorted view on first use.
+
+        Rebuilt automatically if the underlying frame is replaced (checked by identity + length),
+        so re-running .load() or swapping in a different frame can never serve a stale index.
+        """
+        key = "filtered" if filtered else "raw"
+        source_df = self.ms1_filtered if filtered else self.ms1
+        if source_df is None or source_df.empty:
+            return None
+
+        stamp = (id(source_df), len(source_df))
+        cached = self._mz_index_cache.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+
+        order = np.argsort(source_df['mz_array'].values, kind='stable')
+        arrays = (
+            source_df['mz_array'].values[order],
+            source_df['time'].values[order],
+            source_df['intensity_array'].values[order],
+        )
+        self._mz_index_cache[key] = (stamp, arrays)
+        return arrays
+
+    def _slice_mz(self, mz_low: float, mz_high: float, rt_range=None, filtered: bool = True):
+        """Long-form [time, mz_array, intensity_array] rows inside an m/z (and optional RT) window.
+
+        Equivalent to boolean-masking the whole frame, but the m/z bound is resolved with
+        np.searchsorted against the cached sorted index, so cost scales with the number of rows
+        returned rather than with the size of the file.
+        """
+        idx = self._get_mz_index(filtered)
+        if idx is None:
+            return pd.DataFrame(columns=['time', 'mz_array', 'intensity_array'])
+
+        mz_sorted, time_sorted, int_sorted = idx
+        lo = int(np.searchsorted(mz_sorted, mz_low, side='left'))
+        hi = int(np.searchsorted(mz_sorted, mz_high, side='right'))
+        if hi <= lo:
+            return pd.DataFrame(columns=['time', 'mz_array', 'intensity_array'])
+
+        times, mzs, ints = time_sorted[lo:hi], mz_sorted[lo:hi], int_sorted[lo:hi]
+        if rt_range:
+            keep = (times >= rt_range[0]) & (times <= rt_range[1])
+            times, mzs, ints = times[keep], mzs[keep], ints[keep]
+
+        # A fresh RangeIndex, unlike the duplicate-heavy index the exploded ms1 frame carries --
+        # which is what makes .loc[idxmax] lookups downstream unambiguous.
+        return pd.DataFrame({'time': times, 'mz_array': mzs, 'intensity_array': ints})
 
     def get_raw_data(self, mz_range: list = [400, 2000], rt_range: tuple = None, filtered: bool = True):
         """Returns the raw or filtered MS1 data within specified m/z and retention time ranges."""
@@ -228,11 +342,11 @@ class MassSpectrum:
             print("Warning: Source dataframe is empty.")
             return pd.DataFrame()
 
+        if mz_range:
+            return self._slice_mz(mz_range[0], mz_range[1], rt_range=rt_range, filtered=filtered)
+
         if rt_range:
             source_df = source_df[source_df['time'].between(rt_range[0], rt_range[1])]
-
-        if mz_range:
-            source_df = source_df[source_df['mz_array'].between(mz_range[0], mz_range[1])]
 
         return source_df
 
@@ -246,21 +360,12 @@ class MassSpectrum:
             print("Warning: Source dataframe for XIC is empty.")
             return pd.DataFrame()
 
-        df = source_df
-
-        if rt_range:
-            df = df[df['time'].between(rt_range[0], rt_range[1])]
-
         if use_ppm:
             tolerance = mz * (tolerance_ppm / 1e6)
         else:
             tolerance = tolerance_da
 
-        # NumPy-based filtering is efficient
-        mask = (df['mz_array'] >= mz - tolerance) & (df['mz_array'] <= mz + tolerance)
-        xic = df[mask].copy()
-
-        return xic
+        return self._slice_mz(mz - tolerance, mz + tolerance, rt_range=rt_range, filtered=filtered)
 
     def get_extracted_compound_chromatogram(self, mass: float, filtered=True, tolerance_ppm=20, use_ppm=True,
                                             tolerance_da=0.05, mz_range=[400, 2000], rt_range=None):
@@ -272,10 +377,9 @@ class MassSpectrum:
             print("Warning: Source dataframe for XIC is empty.")
             return pd.DataFrame()
 
-        df = source_df
-
-        if rt_range:
-            df = df[df['time'].between(rt_range[0], rt_range[1])]
+        # NOTE: no full-frame RT mask here. get_extracted_ion_chromatogram already applies rt_range
+        # per m/z window via the sorted-index fast path, so masking the whole ~3.5M-row frame first
+        # (once per compound) was pure redundant work -- it dominated the remaining runtime.
         highest_charge = int(mass / mz_range[0]) + 1
         lowest_charge = max(1, int(mass / mz_range[1]) - 1)
         charges = range(lowest_charge, highest_charge + 1)
@@ -385,23 +489,25 @@ class MSExperiment:
         self.core_start = kwargs.get('core_start', 0)
         self.core_end = kwargs.get('core_end', 0)
 
-        # FIX: Initialize target_peptides as an empty list to prevent AttributeError.
+        # Populated later by AnalysisResults.expand_and_initialize_targets().
         self.target_peptides = []
-        print(f"--- MSExperiment INITIALIZED for {self.spectrum_id} (NEW VERSION) ---")
+        print(f"--- MSExperiment initialized for {self.spectrum_id} ---")
 
     @property
     def mzml_path(self) -> Path:
-        """Returns the full, validated path to the .mzML file."""
-        path = Path(self.input_mzml_folder) / self.input_mzml
-        if not path.is_file():
-            raise FileNotFoundError(f"The .mzML file was not found: {path}")
-        return path
+        """Returns the path to the .mzML file. Deliberately does NOT require the file to exist: the
+        raw mzML is only actually read on a spectrum-cache MISS (MassSpectrum._parse_mzml validates
+        it there). Validating here instead made every consumer that merely CONSTRUCTS a MassSpectrum
+        -- e.g. SI-report rendering, which normally serves the representative replicate straight from
+        its cached _ms1/_ms2 pickles -- crash whenever only the raw mzML (not the cache) was missing,
+        such as when the data has been moved and the original mzMLs aren't on the current disk."""
+        return Path(self.input_mzml_folder) / self.input_mzml
 
     @property
     def output_path(self) -> Path:
         """Returns the path to the output folder, creating it if it doesn't exist."""
         path = Path(self.output_folder_name)
-        path.mkdir(parents=True, exist_ok=True)  # Creates the folder if needed
+        os.makedirs(to_long_path(path), exist_ok=True)  # Creates the folder if needed (long-path-safe)
         return path
 
     @property
@@ -413,10 +519,10 @@ class MSExperiment:
     def load(cls, filepath: Path | str) -> 'MSExperiment':
         """Static factory helper to cleanly reload an MSExperiment metadata file."""
         filepath = Path(filepath)
-        if not filepath.exists():
+        if not os.path.exists(to_long_path(filepath)):
             raise FileNotFoundError(f"No saved experiment metadata found at: {filepath}")
 
-        with open(filepath, 'rb') as f:
+        with open(to_long_path(filepath), 'rb') as f:
             # Note: Ensure you imported pickle as `pkl` or change to `pickle`
             obj = pkl.load(f)
         return obj
@@ -437,17 +543,18 @@ class MSExperiment:
     def save(self, renew: bool = False):
         """Saves the experiment object as a pickle file in the output folder."""
         save_path = self.output_path / f"{self.spectrum_id}_experiment.pkl"
-        if save_path.exists() and renew:
+        save_path_long = to_long_path(save_path)
+        if os.path.exists(save_path_long) and renew:
             print(f"Experiment file already exists: {save_path}. Overwriting due to renew=True.")
             # we remove the existing file
-            os.remove(save_path)
+            os.remove(save_path_long)
             # Save the object
-            with open(save_path, 'wb') as f:
+            with open(save_path_long, 'wb') as f:
                 pkl.dump(self, f)
 
             print(f"Experiment saved to: {save_path}")
-        elif not save_path.exists():
+        elif not os.path.exists(save_path_long):
             # Save the object
-            with open(save_path, 'wb') as f:
+            with open(save_path_long, 'wb') as f:
                 pkl.dump(self, f)
             print(f"Experiment saved to: {save_path}")

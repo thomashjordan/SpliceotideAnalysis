@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "LCMS_RiPP: LC-MS/MS analysis pipeline for RiPP post-translational modifications"
+authors:
+  - family-names: Jordan
+    given-names: Thomas H.
+license: MIT
+repository-code: "https://github.com/thomashjordan/LCMS_RiPP"
+type: software
+# Add `version`, `date-released`, `doi` (e.g. a Zenodo DOI) and a `preferred-citation`
+# block pointing to the paper once it is published.

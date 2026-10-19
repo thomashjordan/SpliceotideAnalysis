@@ -30,7 +30,7 @@ except ImportError:
     sys.exit(1)
 
 from analysis_containers import ReplicateGroupResults
-from pipeline_functions import pipeline_find_and_score_peak
+from pipeline_functions import pipeline_find_and_score_peak, NoRawApexError
 
 DEFAULT_RT_RANGE = (3.0, 15.0)
 DEFAULT_MZ_RANGE = (400, 2000)
@@ -41,6 +41,17 @@ IMG_STYLE = {"width": "100%", "height": "auto", "display": "block"}
 # Process-lifetime caches, keyed by group index so navigation between groups is instant on repeat visits.
 _GROUP_CACHE = {}
 _DYNAMIC_STATE = {}  # (group_idx, block_idx, rep_id) -> {"peak": PeptidePeak|None, "is_stub": bool, "rt_start": float, "rt_end": float}
+
+# Each cached group pins a full MassSpectrum per replicate (ms1 + ms1_filtered + ms2 -- hundreds of
+# MB each), so caching every visited group unbounded exhausts RAM on a many-group run. Keep only the
+# few most-recently-loaded groups' heavy caches; evicting a group only drops its recomputable cache,
+# NOT its _DYNAMIC_STATE (edits persist, keyed separately), so revisiting simply rebuilds transparently.
+_MAX_CACHED_GROUPS = 3
+_GROUP_LOAD_ORDER = []  # group_idx, most-recently-loaded last
+
+# How many target/charge blocks to draw before offering a "Show all blocks" button (see
+# build_group_page). Keeps first paint fast on groups with many blocks.
+INITIAL_BLOCKS_RENDERED = 4
 
 
 def parse_args():
@@ -284,9 +295,23 @@ def _triggered_component_id():
 # --- GROUP LOADING / CACHING ---
 # ==============================================================================
 
+def _touch_group(group_idx: int):
+    """Mark a group as most-recently-used and evict the heavy caches of groups beyond the limit."""
+    if group_idx in _GROUP_LOAD_ORDER:
+        _GROUP_LOAD_ORDER.remove(group_idx)
+    _GROUP_LOAD_ORDER.append(group_idx)
+    while len(_GROUP_LOAD_ORDER) > _MAX_CACHED_GROUPS:
+        evict = _GROUP_LOAD_ORDER.pop(0)
+        cache = _GROUP_CACHE.pop(evict, None)
+        if cache is not None:
+            print(f"[Cache] Evicting group {evict + 1} cache to free memory "
+                  f"(keeping {_MAX_CACHED_GROUPS} most-recent). Edits are preserved.")
+
+
 def load_group(group_idx: int, groups_meta: list, max_ppm: float) -> dict:
     """Lazily loads and caches everything needed to render one group's dashboard."""
     if group_idx in _GROUP_CACHE:
+        _touch_group(group_idx)
         return _GROUP_CACHE[group_idx]
 
     meta = groups_meta[group_idx]
@@ -336,6 +361,7 @@ def load_group(group_idx: int, groups_meta: list, max_ppm: float) -> dict:
         "blocks": blocks,
     }
     _GROUP_CACHE[group_idx] = cache
+    _touch_group(group_idx)
 
     _seed_dynamic_state(group_idx, cache)
     return cache
@@ -478,7 +504,9 @@ def render_summary_rows(peak):
 def render_dynamic_panel(state):
     """Rows driven by the current dynamic state of one column."""
     if state is None or state.get("is_stub") or state.get("peak") is None:
-        return render_placeholder("Marked as STUB\n(no peak reconstructed)")
+        return render_placeholder(
+            (state or {}).get("reason") or "Marked as STUB\n(no peak reconstructed)"
+        )
     peak = state["peak"]
     return html.Div([render_peak_rows(peak), render_summary_rows(peak)])
 
@@ -626,17 +654,38 @@ def build_group_selector_options(groups_meta: list) -> list:
     ]
 
 
-def build_group_page(group_idx: int, groups_meta: list, max_ppm: float):
+def build_group_page(group_idx: int, groups_meta: list, max_ppm: float, show_all: bool = False):
     cache = load_group(group_idx, groups_meta, max_ppm)
-    if not cache["blocks"]:
+    blocks = cache["blocks"]
+    if not blocks:
         return html.Div(
             "No target/charge combinations were found for this group -- nothing to review.",
             style={"padding": "20px", "color": "#868e96"},
         )
-    return html.Div([
-        build_block_section(group_idx, block_idx, block, cache)
-        for block_idx, block in enumerate(cache["blocks"])
-    ])
+
+    # Each column renders ~7 matplotlib PNGs (~0.8 s), so eagerly drawing every block of a large
+    # group makes first paint take tens of seconds. Draw only the first few blocks up front and let
+    # the reviewer pull in the rest on demand -- the common case is inspecting the top block(s), not
+    # all of them at once. Navigating to a new group resets this back to the initial few.
+    n_to_show = len(blocks) if show_all else min(INITIAL_BLOCKS_RENDERED, len(blocks))
+    children = [
+        build_block_section(group_idx, block_idx, blocks[block_idx], cache)
+        for block_idx in range(n_to_show)
+    ]
+
+    if n_to_show < len(blocks):
+        children.append(html.Div([
+            html.Button(
+                f"Show all {len(blocks)} blocks  ({len(blocks) - n_to_show} more)",
+                id="show-all-blocks-btn", n_clicks=0,
+                style={"fontSize": "14px", "padding": "10px 20px", "fontWeight": "bold",
+                       "cursor": "pointer"},
+            ),
+            html.Div(f"Showing the first {n_to_show} of {len(blocks)} target/charge blocks.",
+                     style={"fontSize": "12px", "color": "#868e96", "marginTop": "6px"}),
+        ], style={"textAlign": "center", "padding": "20px"}))
+
+    return html.Div(children)
 
 
 # ==============================================================================
@@ -690,6 +739,7 @@ def run_review_app(groups_meta: list, port: int = 8051, max_ppm: float = 15.0):
     # would otherwise leak into this one since _GROUP_CACHE/_DYNAMIC_STATE are process-lifetime.
     _GROUP_CACHE.clear()
     _DYNAMIC_STATE.clear()
+    _GROUP_LOAD_ORDER.clear()
 
     app = Dash(__name__)
     app.config.suppress_callback_exceptions = True
@@ -697,6 +747,10 @@ def run_review_app(groups_meta: list, port: int = 8051, max_ppm: float = 15.0):
 
     app.layout = html.Div([
         dcc.Store(id="group-index", data=0),
+        # Single source of truth for what group-content renders: which group, and whether to draw
+        # every block or just the initial few. Written by group navigation (resets show_all) and by
+        # the "Show all blocks" button (sets show_all); read by the render callback below.
+        dcc.Store(id="render-state", data={"group": 0, "show_all": False}),
         html.Div(id="header-bar", style={
             "position": "sticky", "top": 0, "backgroundColor": "#343a40", "color": "white",
             "padding": "10px 16px", "zIndex": 100,
@@ -729,9 +783,35 @@ def run_review_app(groups_meta: list, port: int = 8051, max_ppm: float = 15.0):
             html.Div(source_note, style={"fontSize": "12px", "color": "#ced4da"}),
         ])
 
-    @app.callback(Output("group-content", "children"), Input("group-index", "data"))
-    def update_content(group_idx):
-        return build_group_page(group_idx, groups_meta, max_ppm)
+    # Group navigation resets the render to the new group's first few blocks. prevent_initial_call
+    # so the initial paint comes from render-state's default (avoids a redundant double render).
+    @app.callback(
+        Output("render-state", "data"),
+        Input("group-index", "data"),
+        prevent_initial_call=True,
+    )
+    def reset_render_state_on_group_change(group_idx):
+        return {"group": group_idx, "show_all": False}
+
+    # The "Show all blocks" button (rendered inside group-content when a group is truncated) flips
+    # show_all for the current group. suppress_callback_exceptions=True lets this reference the
+    # dynamically-created button id.
+    @app.callback(
+        Output("render-state", "data", allow_duplicate=True),
+        Input("show-all-blocks-btn", "n_clicks"),
+        State("group-index", "data"),
+        prevent_initial_call=True,
+    )
+    def show_all_blocks(n_clicks, group_idx):
+        if not n_clicks:
+            return dash.no_update
+        return {"group": group_idx, "show_all": True}
+
+    @app.callback(Output("group-content", "children"), Input("render-state", "data"))
+    def update_content(render_state):
+        render_state = render_state or {"group": 0, "show_all": False}
+        return build_group_page(render_state["group"], groups_meta, max_ppm,
+                                show_all=render_state.get("show_all", False))
 
     # group-selector.value and group-index.data are kept in sync in both directions (picking a
     # group from the dropdown jumps straight there; stepping via Prev/Skip/Save&Next updates the
@@ -859,9 +939,19 @@ def run_review_app(groups_meta: list, port: int = 8051, max_ppm: float = 15.0):
                         charge=block["charge"], rt_start=rt_start, rt_end=rt_end,
                     )
                     new_state = {"peak": peak, "is_stub": False, "rt_start": rt_start, "rt_end": rt_end}
+                except NoRawApexError as e:
+                    # Not a crash -- the window genuinely holds no MS1 signal at this charge. Say
+                    # so in the panel rather than falling through to the generic stub message,
+                    # since the EIC above will often look perfectly convincing.
+                    print(f"  [!] No raw MS1 apex for {rep_id}: {e}")
+                    new_state = {
+                        "peak": None, "is_stub": True, "rt_start": rt_start, "rt_end": rt_end,
+                        "reason": f"No MS1 signal at charge +{block['charge']}\nin this RT window\n\n{e}",
+                    }
                 except Exception as e:
                     print(f"  [!] Recompute failed for {rep_id}: {e}")
-                    new_state = {"peak": None, "is_stub": True, "rt_start": rt_start, "rt_end": rt_end}
+                    new_state = {"peak": None, "is_stub": True, "rt_start": rt_start, "rt_end": rt_end,
+                                 "reason": f"Recompute failed:\n{e}"}
 
         _DYNAMIC_STATE[(group_idx, block_idx, rep_id)] = new_state
         return render_dynamic_panel(new_state)

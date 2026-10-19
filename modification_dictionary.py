@@ -1,6 +1,17 @@
+"""Residue composition table used for every mass calculation in the project.
+
+``aa_comp_custom`` is a copy of pyteomics' standard amino-acid compositions extended with the
+custom residue codes that appear in ``modified_sequences`` in the sample sheets (e.g. ``x``
+in ``GGCGPDPxVGVILPWA`` for the spliced product). Each code maps to its elemental composition
+below. Add new modification codes here.
+"""
 from pyteomics import mass, auxiliary
 
-aa_comp_custom = mass.std_aa_comp
+# Copy, don't alias: `mass.std_aa_comp` is pyteomics' process-wide standard residue table. Aliasing
+# it and adding keys below would silently inject our custom residues (orL, dhA, x, xdh, ...) into
+# every other pyteomics user in the process. dict() gives an independent mapping; the Composition
+# values are shared by reference, which is fine since they're never mutated.
+aa_comp_custom = dict(mass.std_aa_comp)
 # we add the custom modifications to the aa_comp dictionary
 aa_comp_custom["orL"] = mass.Composition({'C': 5, 'H': 11, 'N': 1, 'O': 1})
 aa_comp_custom["dhA"] = mass.Composition({'C': 3, 'H': 3, 'N': 1, 'O': 1})

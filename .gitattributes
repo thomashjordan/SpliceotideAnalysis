@@ -1,0 +1,10 @@
+# Normalise line endings in the repository; check out with the platform default.
+* text=auto
+*.py text diff=python
+*.ipynb text
+*.md text
+*.yml text
+
+*.xlsx binary
+*.png binary
+*.pdf binary

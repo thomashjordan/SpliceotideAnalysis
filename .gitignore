@@ -1,12 +1,35 @@
-/input_data_flasks
-/input_data_plates
-/input_excel_files
-/legacy
-/output_data_flasks
-/output_data_plates
-/output_report_files_flasks
-/output_report_files_plates
-/pickles
-/rosetta_modeling
-/summary_data_files
-/test
+# --- Python / tooling ---------------------------------------------------------
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.bak
+.idea/
+.vscode/
+.claude/settings.local.json
+desktop.ini
+Thumbs.db
+~$*
+
+# Scratch files written by plotting_analysis_functions.get_muscle_msa()
+muscle_temp_*.fa
+
+# --- Data: raw spectra, caches and analysis outputs (too large for git) -------
+# Deposit these in a data repository (e.g. Zenodo, MassIVE/PRIDE) instead.
+*.mzML
+*.mzml
+*.raw
+*.pkl
+*.pkl.gz
+/PAPER_WRITING/
+/input_data_flasks/
+/input_data_plates/
+/output_data_flasks/
+/output_data_plates/
+/output_report_files_flasks/
+/output_report_files_plates/
+/pickles/
+/summary_data_files/
+/rosetta_modeling/
+/test/
+/reports/
+/plasmid_data/

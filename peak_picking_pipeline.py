@@ -1,12 +1,28 @@
+#!/usr/bin/env python
+"""Step 1 of the workflow: automated peak picking for every experimental group.
+
+Reads a sample sheet (one row per LC-MS run, see README.md for the column layout), groups the
+rows into biological-replicate cohorts, and for each cohort:
+
+  1. loads/parses each replicate's mzML into a cached MassSpectrum,
+  2. expands the precursor sequence into digest fragments (unmodified + modified states),
+  3. extracts EICs for every fragment/charge, clusters candidate peaks across replicates with
+     DBSCAN, scores them (MS1 isotope pattern, ppm error, MS2 fragment coverage), and
+  4. writes a `{group}_cohort.pkl.gz` ReplicateGroupResults archive under --output_dir.
+
+The cohorts are then curated interactively with peak_reviewing_pipeline.py.
+
+Example:
+    python peak_picking_pipeline.py -i input_excel_files/96_well_plate_expressions.xlsx -o reports/plates
+"""
 import sys
 import argparse
 from pathlib import Path
 import pandas as pd
 import matplotlib
 
-# Set non-interactive or interactive backend as needed
-matplotlib.use('Qt5Agg')  # Or 'TkAgg' if PyQt is not available
-import matplotlib.pyplot as plt
+# Figures are only ever written to disk, never shown, so use the headless backend.
+matplotlib.use('Agg')
 
 # Local project imports
 from pipeline_functions import run_new_analysis_for_group
@@ -69,7 +85,7 @@ def main():
     parser.add_argument(
         "--manual_review",
         action="store_true",
-        help="If set, activates interactive manual review mode for each replicate."
+        help="Deprecated and ignored: manual review is now done with peak_reviewing_pipeline.py."
     )
     args = parser.parse_args()
 

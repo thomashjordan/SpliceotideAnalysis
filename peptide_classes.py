@@ -1,3 +1,13 @@
+"""Peptide-level objects used by the peak-picking pipeline.
+
+* PeptideFragment -- a theoretical b/y fragment ion.
+* TargetPeptide   -- a theoretical digest fragment (optionally modified): composition, monoisotopic
+                     mass, isotopologue envelope and fragment ladder.
+* PeptidePeak     -- one chromatographic peak (or an empty "stub") for a TargetPeptide at a given
+                     charge in one replicate. Holds the EIC slice and apex MS1/MS2 data and
+                     implements integration, MS1 isotope-pattern validation, MS2 fragment
+                     matching, quality scoring and the diagnostic plots used in the SI.
+"""
 import numpy as np
 import pandas as pd
 import scipy as sp
@@ -64,22 +74,53 @@ class TargetPeptide:
 
 
     def get_isotopologues(self, mod_dict: dict, isotope_threshold: float = 0.05, include_monoisotopic: bool = True):
+        # Carbon-only isotope model. Physically, 15N (~0.37%/N) and 34S (~4.2%/S) also feed the
+        # M+1/M+2 envelope, and modelling them would be more accurate -- BUT pyteomics'
+        # mass.isotopologues() enumerates the full Cartesian product of isotope states across every
+        # requested element and only prunes at the end, so C+N+O+S on a ~1900 Da peptide takes ~35 s
+        # PER TARGET (vs ~0.03 s for carbon alone) despite yielding a handful of peaks. Enabling it
+        # naively made target expansion hang. A proper multi-element envelope would need a fast
+        # isotope-convolution routine (O(peaks) not O(combinations)); until that exists, carbon-only
+        # keeps the pipeline fast and matches what it was validated on. The code below still groups
+        # by nominal mass and takes abundance-weighted masses, so it stays correct if the element
+        # set is ever widened.
         elements_with_isotopes = ['C']
-        iterator = pyteomics.mass.isotopologues(composition=self.composition, report_abundance=True,
-                                        overall_threshold=isotope_threshold,
-                                        elements_with_isotopes=elements_with_isotopes)
-        isotopologues = [(f"isotopologue {i}", pyteomics.mass.calculate_mass(composition=comp), comp, abundance) for
-                         i, (comp, abundance) in enumerate(iterator)]
-        if isotopologues and (isotopologues[0][2] == self.composition or isotopologues[0][1] == self.monoisotopic_mass):
-            # we reassign the name of the first isotopologue to monoisotopic
-            isotopologues[0] = ('monoisotopic', isotopologues[0][1], isotopologues[0][2], isotopologues[0][3])
-        elif include_monoisotopic:
-            isotopologues.insert(0, ('monoisotopic', self.monoisotopic_mass, self.composition, 0.0))
+        iterator = pyteomics.mass.isotopologues(
+            composition=self.composition, report_abundance=True,
+            overall_threshold=isotope_threshold, elements_with_isotopes=elements_with_isotopes)
+
+        raw = [(pyteomics.mass.calculate_mass(composition=comp), float(abundance)) for comp, abundance in iterator]
+        if not raw:
+            self.isotopologues = {'name': ['monoisotopic'], 'mass': [self.monoisotopic_mass],
+                                  'formula': [None], 'abundance': [1.0]}
+            return
+
+        # At the instrument's resolution the 13C- and 15N-based M+1 peaks (and likewise M+2, ...)
+        # are not resolved -- they land on top of each other. So collapse every specific-isotope
+        # combination into its nominal isotope cluster (integer Da offset from the monoisotopic
+        # mass), summing abundances and taking the abundance-weighted mean exact mass, which is
+        # exactly where the merged observed peak's centroid sits.
+        mono_mass = min(m for m, _a in raw)
+        clusters = {}
+        for m, a in raw:
+            n = int(round(m - mono_mass))
+            c = clusters.setdefault(n, {'mass_wsum': 0.0, 'abund': 0.0})
+            c['mass_wsum'] += m * a
+            c['abund'] += a
+
+        ordered = sorted(clusters.items())  # ascending nominal offset -> M, M+1, M+2, ...
+        total_abund = sum(c['abund'] for _n, c in ordered) or 1.0
+        names, masses, abunds = [], [], []
+        for idx, (_n, c) in enumerate(ordered):
+            names.append('monoisotopic' if idx == 0 else f'isotopologue {idx}')
+            masses.append(c['mass_wsum'] / c['abund'])
+            abunds.append(c['abund'] / total_abund)
+
         self.isotopologues = {
-            'name': [iso[0] for iso in isotopologues],
-            'mass': [iso[1] for iso in isotopologues],
-            'formula': [iso[2] for iso in isotopologues],
-            'abundance': [iso[3] for iso in isotopologues]
+            'name': names,
+            'mass': masses,
+            'formula': [None] * len(names),
+            'abundance': abunds,
         }
 
     def generate_fragments(self, mod_dict: dict, types=('b', 'y'), max_charge=1):
@@ -108,6 +149,100 @@ class TargetPeptide:
 class PeptidePeak:
     """Represents an observed peak in the mass spectrum that matches a theoretical peptide or fragment."""
 
+    # Defaults backfilled onto peaks unpickled from older result files that predate these
+    # attributes. Without this, loading an old *_results.pkl and touching e.g. `self.is_stub`
+    # (referenced unguarded in ~9 methods) raises AttributeError -- observed in practice.
+    # Maps each backfilled attribute to a zero-arg factory for its default (factories, so mutable
+    # defaults like DataFrames/dicts aren't shared between instances). Values mirror __init__.
+    _PICKLE_DEFAULT_FACTORIES = {
+        "is_stub": lambda: False,
+        "mass_spacing": lambda: None,
+        "autopique_threshold": lambda: 0.0,
+        "quality_metrics": dict,
+        "gaussian_params": lambda: None,
+        "gaussian_errors": lambda: None,
+        "gaussian_r2": lambda: None,
+        "trapz_area": lambda: None,
+        "best_matches": pd.DataFrame,
+        "ms2_matches": pd.DataFrame,
+    }
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        for attr, factory in self._PICKLE_DEFAULT_FACTORIES.items():
+            if attr not in self.__dict__:
+                self.__dict__[attr] = factory()
+        # Older pickles stored raw_apex as the raw stacked scans and have none of the
+        # single/summed split. Rebuild both from whatever raw_apex holds so downstream code and
+        # plots behave identically to freshly-built peaks. If raw_apex is already a clean single
+        # spectrum (one time value) this is a no-op co-add.
+        if "raw_apex_summed" not in self.__dict__:
+            ra = self.__dict__.get("raw_apex")
+            if ra is not None and not ra.empty:
+                self.raw_apex_scans = ra
+                self.raw_apex_single = self._extract_single_apex_scan(ra)
+                self.raw_apex_summed = self._coadd_apex_scans(ra)
+                self.raw_apex = self.raw_apex_summed
+            else:
+                empty_apex = pd.DataFrame(columns=["time", "mz_array", "intensity_array"])
+                self.raw_apex_scans = empty_apex.copy()
+                self.raw_apex_single = empty_apex.copy()
+                self.raw_apex_summed = empty_apex.copy()
+
+    @staticmethod
+    def _extract_single_apex_scan(df: pd.DataFrame) -> pd.DataFrame:
+        """The single most-intense scan (by total intensity) out of a stack of apex scans.
+
+        Returns [time, mz_array, intensity_array] sorted by m/z. If the frame is already one scan
+        (or carries no 'time' column) it is returned as-is.
+        """
+        cols = ["time", "mz_array", "intensity_array"]
+        if df is None or df.empty:
+            return pd.DataFrame(columns=cols)
+        if "time" not in df.columns or df["time"].nunique() <= 1:
+            out = df.copy()
+            if "time" not in out.columns:
+                out["time"] = np.nan
+            return out[cols].sort_values("mz_array").reset_index(drop=True)
+        apex_time = df.groupby("time")["intensity_array"].sum().idxmax()
+        return (df[df["time"] == apex_time][cols]
+                .sort_values("mz_array").reset_index(drop=True))
+
+    @staticmethod
+    def _coadd_apex_scans(df: pd.DataFrame, grid_step: float = 0.001) -> pd.DataFrame:
+        """Co-adds every scan in an apex-window stack onto one common m/z grid.
+
+        Each scan is linearly interpolated onto a shared uniform grid (zero outside its own m/z
+        range) and the interpolated intensities summed -- the standard way to combine profile scans
+        that don't share sample positions. The grid step is deliberately finer than the instrument's
+        native profile spacing (~0.007 Da here): the co-added spectrum feeds the downstream
+        0.0005 Da binner / CWT peak finder, and co-adding onto the native-resolution grid starves
+        that finder (too few points per peak). 0.001 Da keeps ~7 points per native sample without
+        inventing peaks. The result carries a constant 'time' (the apex scan's) and is a single,
+        monotonic, clean spectrum -- which also makes _estimate_mass_spacing and centroiding sane.
+        """
+        cols = ["time", "mz_array", "intensity_array"]
+        if df is None or df.empty:
+            return pd.DataFrame(columns=cols)
+        if "time" not in df.columns or df["time"].nunique() <= 1:
+            out = df.copy()
+            if "time" not in out.columns:
+                out["time"] = np.nan
+            return out[cols].sort_values("mz_array").reset_index(drop=True)
+
+        apex_time = df.groupby("time")["intensity_array"].sum().idxmax()
+        mz_min, mz_max = float(df["mz_array"].min()), float(df["mz_array"].max())
+        if mz_max <= mz_min:
+            return df[df["time"] == apex_time][cols].sort_values("mz_array").reset_index(drop=True)
+
+        grid = np.arange(mz_min, mz_max + grid_step, grid_step)
+        total = np.zeros(len(grid))
+        for _t, scan in df.groupby("time"):
+            s = scan.sort_values("mz_array")
+            total += np.interp(grid, s["mz_array"].values, s["intensity_array"].values,
+                               left=0.0, right=0.0)
+        return pd.DataFrame({"time": apex_time, "mz_array": grid, "intensity_array": total})
+
     def __init__(
             self,
             experiment,
@@ -126,17 +261,42 @@ class PeptidePeak:
         self.charge = charge
         self.is_stub = is_stub
 
-        # Handle raw_apex indexing safely
+        # raw_apex arrives as *all* MS1 scans inside the apex RT window, stacked (one row per raw
+        # profile sample across several scans). Feeding that stack downstream as if it were one
+        # spectrum is wrong: the isotope pattern then mixes samples taken at different points on the
+        # elution profile, and _estimate_mass_spacing sees a ~1e-7 Da min gap (interleaved scans)
+        # and floors to 0.005. Instead we resolve it into two proper single spectra --
+        #   raw_apex_single: the one most-intense scan (fastest, lowest-latency view)
+        #   raw_apex_summed: the scans co-added onto a common m/z grid (better S/N, cleaner isotope
+        #                    envelope) -- and default self.raw_apex to the summed one.
+        # raw_apex_scans keeps the original stack for provenance / RT-window shading on EIC plots.
+        empty_apex = pd.DataFrame(columns=["time", "mz_array", "intensity_array"])
         if raw_apex is not None and not raw_apex.empty:
-            self.raw_apex = raw_apex.sort_values(by="mz_array", ascending=True)
+            raw_sorted = raw_apex.sort_values(by="mz_array", ascending=True)
+            self.raw_apex_scans = raw_sorted
+            self.raw_apex_single = self._extract_single_apex_scan(raw_sorted)
+            self.raw_apex_summed = self._coadd_apex_scans(raw_sorted)
+            self.raw_apex = self.raw_apex_summed
         else:
-            self.raw_apex = pd.DataFrame(
-                columns=["time", "mz_array", "intensity_array"]
-            )
+            self.raw_apex_scans = empty_apex.copy()
+            self.raw_apex_single = empty_apex.copy()
+            self.raw_apex_summed = empty_apex.copy()
+            self.raw_apex = empty_apex.copy()
 
-        # FIX: Pivot the long-form EIC into the wide-form expected by plotting methods.
-        if extracted is not None and not extracted.empty:
-            self.extracted = extracted.pivot_table(
+        # Pivot the long-form EIC into the wide-form expected by plotting methods.
+        # The long-form EIC handed in here covers *every* plausible charge state of the target
+        # (get_extracted_compound_chromatogram sweeps a whole charge range), so it has to be
+        # narrowed to this peak's own charge before the pivot. Without that filter the pivot's
+        # aggfunc='sum' collapses all charge states into one trace that is then labelled with
+        # this charge's isotopologue m/z values -- a peak carrying no signal at all at its own
+        # charge still renders a textbook EIC borrowed from a neighbouring charge state, while
+        # raw_apex (which *is* charge-specific) comes back empty and the raw m/z panel is blank.
+        eic_long = extracted if extracted is not None else pd.DataFrame()
+        if not eic_long.empty and 'charge' in getattr(eic_long, 'columns', []):
+            eic_long = eic_long[eic_long['charge'] == self.charge]
+
+        if not eic_long.empty:
+            self.extracted = eic_long.pivot_table(
                 index='time',
                 columns='isotopologue',
                 values='intensity_array',
@@ -176,6 +336,7 @@ class PeptidePeak:
 
         self.trapz_area = 0.0 if is_stub else None
         self.gaussian_params, self.gaussian_errors = None, None
+        self.gaussian_r2 = None
 
         self.raw_apex_interp = pd.DataFrame()
         self.raw_apex_bin = pd.DataFrame()
@@ -290,10 +451,21 @@ class PeptidePeak:
                     (10e11, self.zoomed_extracted.index.max(), 2, 100, 10e9)),method="trf")
             self.gaussian_params = gaussian_params
             self.gaussian_errors = np.sqrt(np.diag(pcov))
+
+            # Coefficient of determination of the fit vs the observed zoomed EIC. curve_fit almost
+            # always "succeeds" here (maxfev=1e6), so success alone says nothing about peak shape.
+            # Store R^2 so calculate_quality_score can reward a genuinely Gaussian elution profile
+            # instead of assigning a flat 0.9 to every converged fit.
+            y = self.zoomed_extracted["total_intensity"].to_numpy(dtype=float)
+            y_fit = asym_peak(self.zoomed_extracted.index.to_numpy(dtype=float), *gaussian_params)
+            ss_res = float(np.sum((y - y_fit) ** 2))
+            ss_tot = float(np.sum((y - y.mean()) ** 2))
+            self.gaussian_r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
         except Exception as e:
             print(f"Warning: Could not fit asymmetric Gaussian: {e}")
             self.gaussian_params = None
             self.gaussian_errors = None
+            self.gaussian_r2 = None
 
     def _estimate_mass_spacing(self):
         if self.raw_apex.empty:
@@ -378,8 +550,6 @@ class PeptidePeak:
         resample_delta = max(self.mass_spacing, 1e-6)
         new_mzs = np.arange(min(mzs), max(mzs) + resample_delta, resample_delta)
         new_intensities = np.interp(new_mzs, mzs, intensities)
-        print(
-            f"      [DEBUG AutoPique] raw_apex points={len(mzs)} | mass_spacing={self.mass_spacing} | resample_delta={resample_delta} | new_mzs size={len(new_mzs)}")
 
         if len(new_mzs) > 100000:
             print(f"      [WARNING] AutoPique array is massive ({len(new_mzs)} points)! SciPy correlate will hang!")
@@ -481,24 +651,38 @@ class PeptidePeak:
         mzs, intensities = np.array([]), np.array([])
         distance_points = 1
 
+        def _distance_points(step):
+            # Peaks-must-be-this-many-samples-apart, from a per-sample m/z step. Guards against a
+            # zero/None/non-finite step (e.g. a 1-point spectrum, where the grid spacing is
+            # undefined) so this never divides by zero or indexes an empty np.diff.
+            if step is None or not np.isfinite(step) or step <= 0:
+                return 1
+            return max(1, int(distance / step))
+
         if data_source == "raw" and not self.raw_apex.empty:
             mzs = self.raw_apex["mz_array"].values
             intensities = self.raw_apex["intensity_array"].values
-            distance_points = max(50, int(distance / self.mass_spacing))
+            distance_points = max(50, _distance_points(self.mass_spacing))
         elif data_source == "interp" and not self.raw_apex_interp.empty:
             mzs = self.raw_apex_interp["mz_array"].values
             intensities = self.raw_apex_interp["intensity_array"].values
-            distance_points = max(1, int(distance / bin_size))
+            distance_points = _distance_points(bin_size)
         elif data_source == "autopique" and not self.raw_apex_autopique.empty:
             mzs = self.raw_apex_autopique["mz_array"].values
             intensities = self.raw_apex_autopique["intensity_array"].values
-            distance_points = max(1, int(distance / np.diff(mzs)[0]))
+            # Grid spacing = first sample gap, but only if there are >=2 samples; fall back to the
+            # estimated mass spacing (that's the resample delta autopique used) then to bin_size.
+            diffs = np.diff(mzs)
+            step = diffs[0] if diffs.size else (self.mass_spacing if self.mass_spacing else bin_size)
+            distance_points = _distance_points(step)
         elif data_source == "bin" and not self.raw_apex_bin.empty:
             mzs = self.raw_apex_bin["mz_array"].values
             intensities = self.raw_apex_bin["intensity_array"].values
-            distance_points = max(1, int(distance / bin_size))
+            distance_points = _distance_points(bin_size)
 
-        if len(mzs) == 0:
+        # Peak-finding needs at least 3 samples to have an interior local maximum; anything smaller
+        # can't yield a peak and would only risk edge-case crashes below, so bail cleanly.
+        if len(mzs) < 3:
             return pd.DataFrame(), mzs, intensities
 
         max_intensity = np.max(intensities)
@@ -549,14 +733,48 @@ class PeptidePeak:
         if len(peaks_indices) == 0:
             return pd.DataFrame(), mzs, intensities
 
-        # 5. CONSTRUCT RESULTS DATAFRAME
+        # 5. CENTROID each peak. The picked index lands on the tallest *sample* of a profile peak,
+        # which on a ~0.007 Da (7 ppm at m/z 950) grid carries up to half-a-sample of pure
+        # quantisation error -- enough on its own to blow the ppm match at higher charge. A
+        # parabolic fit through the sample and its two neighbours recovers the true sub-sample apex
+        # m/z, so the reported error reflects the instrument, not the grid.
+        peaks_indices = np.asarray(peaks_indices, dtype=int)
+        centroid_mzs = self._parabolic_centroid(mzs, intensities, peaks_indices)
+
+        # 6. CONSTRUCT RESULTS DATAFRAME
         peaks_df = pd.DataFrame({
-            "mz_array_peak": mzs[peaks_indices],
+            "mz_array_peak": centroid_mzs,
             "intensity_array_peak": intensities[peaks_indices],
             "data_source": data_source,
             "method": method,})
 
         return peaks_df, mzs, intensities
+
+    @staticmethod
+    def _parabolic_centroid(mzs: np.ndarray, intensities: np.ndarray, peak_indices: np.ndarray) -> np.ndarray:
+        """Sub-sample peak-apex m/z via a 3-point parabolic fit around each picked index.
+
+        For a peak at sample i, fits a parabola through (i-1, i, i+1) and returns the vertex m/z.
+        Edge samples and flat/degenerate triples fall back to the raw sample m/z. The vertex offset
+        is clamped to +-1 sample so a noisy triple can never throw the centroid outside the peak.
+        """
+        mzs = np.asarray(mzs, dtype=float)
+        intensities = np.asarray(intensities, dtype=float)
+        out = mzs[peak_indices].astype(float).copy()
+        for k, i in enumerate(peak_indices):
+            if i <= 0 or i >= len(mzs) - 1:
+                continue
+            y0, y1, y2 = intensities[i - 1], intensities[i], intensities[i + 1]
+            denom = y0 - 2.0 * y1 + y2
+            if denom == 0 or not np.isfinite(denom):
+                continue
+            delta = 0.5 * (y0 - y2) / denom  # vertex offset in samples, ideally in [-1, 1]
+            if not np.isfinite(delta):
+                continue
+            delta = float(np.clip(delta, -1.0, 1.0))
+            half_spacing = (mzs[i + 1] - mzs[i - 1]) / 2.0
+            out[k] = mzs[i] + delta * half_spacing
+        return out
 
 
     def _match_peaks_to_target(self, method_number: int = 1, tolerance: float = 10):
@@ -638,9 +856,15 @@ class PeptidePeak:
         peak_intensities = peaks_df["intensity_array_peak"].values
 
         matches = {col: [] for col in columns_layout}
-        mz_tolerance = (target_mzs[1] * tolerance / 1e6) / self.charge
 
         for tgt_mz, tgt_name in zip(target_mzs, target_names):
+            # `tolerance` is in ppm and tgt_mz is already an observed-scale m/z, so tgt_mz*ppm/1e6
+            # is the full Da window on the m/z axis. It must NOT be divided by charge again: a
+            # ppm window is charge-independent on the m/z axis, and the previous extra /self.charge
+            # silently tightened matching to tolerance/z (5 ppm at +2, 3.3 ppm at +3), below the
+            # instrument's own profile spacing (~7 ppm here) -- which is what drove so many real
+            # peaks to a NaN mass error and a Reject tier at higher charge.
+            mz_tolerance = tgt_mz * tolerance / 1e6
             mz_delta = 3 / (4 * self.charge)
             window_indices = np.where(
                 (peak_mzs >= tgt_mz - mz_delta) & (peak_mzs <= tgt_mz + mz_delta)
@@ -864,65 +1088,6 @@ class PeptidePeak:
 
         return overall_pass
 
-    def process_and_find_peaks(self, snr_level: int = 2, autopique_init:int=500,
-                               prominence: float = 0.5, height: float = 1000, rel_height: float=0.2,
-                               ms1_distance: float = 0.05, settings_1: tuple=('bin', 'find_peaks_cwt'),
-                               settings_2: tuple=('autopique', 'find_peaks'), bin_size: float = 0.0005):
-        """
-        Runs the full interpolation, thresholding, and peak finding workflow.
-        Returns the final DataFrame of found peaks.
-        """
-        if self.raw_apex is None or self.raw_apex.empty:
-            print("Processing failed: Initial raw_apex data is missing.")
-            scipy_peaks = pd.DataFrame()
-            return scipy_peaks
-
-        # 1. First step: interpolate and bin the raw apex data to get a cleaner spectrum for peak finding
-        self._estimate_mass_spacing()
-        if self.mass_spacing is None:
-            print("      [DEBUG] Mass spacing could not be estimated. Skipping MS1 peak finding.")
-            return pd.DataFrame(), pd.DataFrame()
-        print(f"      [DEBUG] Estimated mass spacing: {self.mass_spacing:.5f}")
-
-        self._interpolate_peak_mzs(interp_dist=bin_size)
-        if self.raw_apex_interp is None or self.raw_apex_interp.empty:
-            print("Processing failed at interpolation step.")
-            scipy_peaks_1 = pd.DataFrame()
-            scipy_peaks_2 = pd.DataFrame()
-            return scipy_peaks_1, scipy_peaks_2
-        print(f"      [DEBUG] Interpolated MS1 has {len(self.raw_apex_interp)} points.")
-
-        self._bin_peak_mzs(bin_size=bin_size)
-        if self.raw_apex_bin is None or self.raw_apex_bin.empty:
-            print("Processing failed at binning step.")
-            scipy_peaks_1 = pd.DataFrame()
-            scipy_peaks_2 = pd.DataFrame()
-            return scipy_peaks_1, scipy_peaks_2
-        print(f"      [DEBUG] Binned MS1 has {len(self.raw_apex_bin)} points.")
-
-        # 2. Second step
-        self._autopique_threshold_estimation(snr_level=snr_level, initial_threshold=autopique_init)
-        if self.raw_apex_autopique is None or self.raw_apex_autopique.empty:
-            print("Processing failed at autopique thresholding step.")
-            scipy_peaks_1 = pd.DataFrame()
-            scipy_peaks_2 = pd.DataFrame()
-            return scipy_peaks_1, scipy_peaks_2
-        print(f"      [DEBUG] Autopique threshold: {self.autopique_threshold:.2f}. Filtered MS1 has {len(self.raw_apex_autopique)} points.")
-
-        # 3. Do the first peak picking with binned data and cwt
-        scipy_peaks_1, mzs_1, intensities_1 = self._find_ms1_peaks_scipy(distance=ms1_distance, prominence=prominence, height=height,
-                                   rel_height=rel_height, data_source=settings_1[0], method=settings_1[1], bin_size=bin_size)
-
-        # 4. Do the second peak picking with the autopique filtered data and find_peaks to get the properties
-        scipy_peaks_2, mzs_2, intensities_2 = self._find_ms1_peaks_scipy(distance=ms1_distance, prominence=prominence, height=height,
-                                   rel_height=rel_height, data_source=settings_2[0], method=settings_2[1], bin_size=bin_size)
-
-        self.scipy_peaks_1, self.scipy_peaks_2 = scipy_peaks_1, scipy_peaks_2
-        self.mzs_1, self.intensities_1 = mzs_1, intensities_1
-        self.mzs_2, self.intensities_2 = mzs_2, intensities_2
-        return self.scipy_peaks_1, self.scipy_peaks_2
-
-
     def calculate_quality_score(self):
         """
         Calculates a multi-factor quality score from 0.0 to 1.0.
@@ -952,9 +1117,15 @@ class PeptidePeak:
         else:
             scores['iso'] = 0.0
 
-        # 3. SHAPE SCORE (Gaussian Fit R-squared or presence)
-        if self.gaussian_params is not None:
-            scores['shape'] = 0.9  # High score for successful fit
+        # 3. SHAPE SCORE -- the actual goodness-of-fit of the asymmetric-Gaussian elution model,
+        # not a flat 0.9 for any converged fit. R^2 is clamped to [0, 1] (a fit worse than a flat
+        # line can go negative). A converged fit with no stored R^2 (older objects) keeps the old
+        # 0.9; a peak with area but no fit stays neutral at 0.5.
+        r2 = getattr(self, 'gaussian_r2', None)
+        if self.gaussian_params is not None and r2 is not None and not pd.isna(r2):
+            scores['shape'] = float(np.clip(r2, 0.0, 1.0))
+        elif self.gaussian_params is not None:
+            scores['shape'] = 0.9  # converged fit, R^2 unavailable (e.g. legacy pickle)
         elif self.trapz_area and self.trapz_area > 0:
             scores['shape'] = 0.5  # Neutral score
         else:
@@ -1077,9 +1248,14 @@ class PeptidePeak:
             if name in self.extracted.columns:
                 ax.plot(self.extracted.index, self.extracted[name], label=f"{name} m/z {mz:.4f}")
 
-        if self.raw_apex is not None and not self.raw_apex.empty:
-            ax.axvline(self.raw_apex["time"].min(), color="k", linestyle="--", alpha=0.7)
-            ax.axvline(self.raw_apex["time"].max(), color="k", linestyle="--", alpha=0.7)
+        # Shade the apex RT window from the full scan stack (raw_apex itself is now the co-added
+        # single spectrum with a constant time). Fall back to raw_apex for older objects.
+        apex_window = getattr(self, "raw_apex_scans", None)
+        if apex_window is None or apex_window.empty:
+            apex_window = self.raw_apex
+        if apex_window is not None and not apex_window.empty and "time" in apex_window.columns:
+            ax.axvline(apex_window["time"].min(), color="k", linestyle="--", alpha=0.7)
+            ax.axvline(apex_window["time"].max(), color="k", linestyle="--", alpha=0.7)
 
         ax.set_xlim(time_window_ecc)
         ax.set_xlabel("Retention Time (min)")
@@ -1132,6 +1308,11 @@ class PeptidePeak:
         if self.raw_apex is not None and not self.raw_apex.empty:
             ax.plot(self.raw_apex["mz_array"], self.raw_apex["intensity_array"], label="Raw Data", color="black",
                     linestyle="--", alpha=0.5)
+        else:
+            # Say it out loud instead of drawing an empty frame: an EIC can look convincing while
+            # this charge has no MS1 signal at all, and older pickles still carry such peaks.
+            ax.text(0.5, 0.5, "No raw MS1 data\nat this charge/RT", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=9, color="#c92a2a")
         if self.scipy_peaks_1 is not None and not self.scipy_peaks_1.empty:
             ax.scatter(self.scipy_peaks_1["mz_array_peak"], self.scipy_peaks_1["intensity_array_peak"], color="purple",
                        marker="x", s=80, label="Scipy Peaks CWT")
