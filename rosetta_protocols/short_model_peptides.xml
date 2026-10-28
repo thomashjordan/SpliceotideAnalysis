@@ -1,0 +1,144 @@
+<ROSETTASCRIPTS>
+    <SCOREFXNS>
+        <ScoreFunction name="ref_full" weights="ref2015">
+            <Reweight scoretype="coordinate_constraint" weight="0.6"/>
+        </ScoreFunction>
+        <ScoreFunction name="soft_rep_full" weights="ref2015_soft">
+            <Reweight scoretype="coordinate_constraint" weight="0.6"/>
+        </ScoreFunction>
+        <ScoreFunction name="ref_pure" weights="ref2015"/>
+    </SCOREFXNS>
+
+    <RESIDUE_SELECTORS>
+        <Index name="lib_pos" resnums="84A,85A,86A,87A,88A,89A,90A,91A"/>
+        <Chain name="sc_chains" chains="D,X,Y"/>
+
+        <Index name="ress_fix" resnums="25D,63D,113D,126D,184D,19D,23D,26D,251D,269D,316D,319D,325D,329D,346D"/>
+        <Index name="ligs" resnums="1X,2X,3X,4X"/>
+        <Index name="ligs_n_res" resnums="1X,2X,3X,4X,25D,63D,113D,126D,184D,19D,23D,26D,251D,269D,316D,319D,325D,329D,346D"/>
+    </RESIDUE_SELECTORS>
+
+    <SIMPLE_METRICS>
+        <SasaMetric name="sasa" residue_selector="lib_pos"/>
+    </SIMPLE_METRICS>
+
+    <TASKOPERATIONS>
+        <InitializeFromCommandline name="init"/>
+        <RestrictToRepacking name="rtr"/>
+        <IncludeCurrent name="include_curr"/>
+
+        <OperateOnResidueSubset name="fix_not_neighbor">
+            <Not>
+                <Neighborhood distance="15" selector="lib_pos"/>
+            </Not>
+            <PreventRepackingRLT/>
+        </OperateOnResidueSubset>
+
+        <OperateOnResidueSubset name="fix_ligs_n_res" selector="ligs_n_res">
+                <PreventRepackingRLT/>
+        </OperateOnResidueSubset>
+
+        <OperateOnResidueSubset name="lib_pos_TO">
+            <Not selector="lib_pos"/>
+            <PreventRepackingRLT/>
+        </OperateOnResidueSubset>
+
+        <OperateOnResidueSubset name="not_to_cst_sc">
+            <Not selector="ress_fix"/>
+            <PreventRepackingRLT/>
+        </OperateOnResidueSubset>
+
+        <OperateOnResidueSubset name="not_to_cst_ligs">
+            <Not selector="ligs"/>
+                <PreventRepackingRLT/>
+        </OperateOnResidueSubset>
+
+        <OperateOnResidueSubset name="not_to_cst_ligs_n_res">
+            <Not selector="ligs_n_res"/>
+                <PreventRepackingRLT/>
+        </OperateOnResidueSubset>
+    </TASKOPERATIONS>
+
+    <MOVERS>
+        <AtomTree name="tree" docking_ft="1"/>
+        <AtomCoordinateCstMover name="add_CA_cst" bounded="false" native="true"/>
+        <TaskAwareCsts name="TA_cst" anchor_resnum="1X" cst_type="bounded" task_operations="not_to_cst_ligs_n_res"/>
+        <AtomCoordinateCstMover name="fix_res_sc_cst" coord_dev="0.5" bounded="false" sidechain="true" task_operations="not_to_cst_sc"/>
+        <AtomCoordinateCstMover name="fix_ligs" coord_dev="0.01" bounded="true" sidechain="true" task_operations="not_to_cst_ligs"/>
+
+        <MutateResidue name="mutres0" new_res="%%new_res0%%" target="%%target0%%" preserve_atom_coords="%%pac0%%"/>
+		<MutateResidue name="mutres1" new_res="%%new_res1%%" target="%%target1%%" preserve_atom_coords="%%pac1%%"/>
+		<MutateResidue name="mutres2" new_res="%%new_res2%%" target="%%target2%%" preserve_atom_coords="%%pac2%%"/>
+		<MutateResidue name="mutres3" new_res="%%new_res3%%" target="%%target3%%" preserve_atom_coords="%%pac3%%"/>
+        <MutateResidue name="mutres4" new_res="%%new_res4%%" target="%%target4%%" preserve_atom_coords="%%pac4%%"/>
+        <MutateResidue name="mutres5" new_res="%%new_res5%%" target="%%target5%%" preserve_atom_coords="%%pac5%%"/>
+
+        <PackRotamersMover name="soft_repack" scorefxn="soft_rep_full" task_operations="init,rtr,fix_ligs_n_res,include_curr,fix_not_neighbor"/>
+        <MinMover name="min" scorefxn="ref_full" chi="1" bb="1" jump="ALL"/>
+        <PackRotamersMover name="prm" scorefxn="ref_full" task_operations="init,rtr,fix_ligs_n_res,include_curr,fix_not_neighbor"/>
+
+    </MOVERS>
+
+    <FILTERS>
+        <ScoreType name="stability_score_full" scorefxn="ref_full" score_type="total_score" confidence="0" threshold="0"/>
+        <ScoreType name="stability_pure" scorefxn="ref_pure" score_type="total_score" confidence="0" threshold="0"/>
+        <Rmsd name="rmsd" confidence="0"/>
+        <PackStat name="packstat" threshold="0.001"/>
+
+        <EnzScore name="ligand_score_1X" scorefxn="ref_full" score_type="total_score" pdb_num="1X" energy_cutoff="1000000"/>
+        <EnzScore name="ligand_score_2X" scorefxn="ref_full" score_type="total_score" pdb_num="2X" energy_cutoff="1000000"/>
+        <EnzScore name="ligand_score_3X" scorefxn="ref_full" score_type="total_score" pdb_num="3X" energy_cutoff="1000000"/>
+        <EnzScore name="ligand_score_4X" scorefxn="ref_full" score_type="total_score" pdb_num="4X" energy_cutoff="1000000"/>
+
+        <ShapeComplementarity name="sc" min_sc="0.0001" residue_selector1="lib_pos" residue_selector2="sc_chains" write_int_area="true"/>
+        <!-- <ShapeComplementarity name="shape_comp" min_sc="0" jump="5" write_int_area="true" confidence="0"/> -->
+        <TaskAwareScoreType name="energy_peptide" scorefxn="ref_pure" task_operations="lib_pos_TO"  score_type="total_score" mode="total"/>
+
+        <DesignableResidues name="desres_lib_pos_TO" task_operations="lib_pos_TO" designable="1" packable="1"/>
+        <DesignableResidues name="desres_not_to_cst_sc" task_operations="not_to_cst_sc" designable="1" packable="1"/>
+        <DesignableResidues name="desres_not_to_cst_ligs" task_operations="not_to_cst_ligs" designable="1" packable="1"/>
+        <DesignableResidues name="desres_not_to_cst_ligs_n_res" task_operations="not_to_cst_ligs_n_res" designable="1" packable="1"/>
+    </FILTERS>
+
+    <PROTOCOLS>
+        <Add mover_name="tree"/>
+        <Add mover_name="TA_cst"/>
+
+        <Add mover_name="add_CA_cst"/>
+        <Add mover_name="fix_res_sc_cst"/>
+        <Add mover_name="fix_ligs"/>
+
+        <Add mover="mutres0"/>
+		<Add mover="mutres1"/>
+		<Add mover="mutres2"/>
+		<Add mover="mutres3"/>
+        <Add mover="mutres4"/>
+        <Add mover="mutres5"/>
+
+        <Add mover="min"/>
+        <Add mover="prm"/>
+        <Add mover="min"/>
+
+
+        <Add metrics="sasa"/>
+
+        <Add filter="stability_score_full"/>
+        <Add filter="stability_pure"/>
+        <Add filter="rmsd"/>
+
+        <Add filter="sc"/>
+        <Add filter="packstat"/>
+        <Add filter="energy_peptide"/>
+
+        <Add filter="ligand_score_1X"/>
+		<Add filter="ligand_score_2X"/>
+		<Add filter="ligand_score_3X"/>
+		<Add filter="ligand_score_4X"/>
+
+        <Add filter="desres_lib_pos_TO"/>
+        <Add filter="desres_not_to_cst_sc"/>
+        <Add filter="desres_not_to_cst_ligs"/>
+        <Add filter="desres_not_to_cst_ligs_n_res"/>
+    </PROTOCOLS>
+    <OUTPUT scorefxn="ref_pure"/>
+</ROSETTASCRIPTS>

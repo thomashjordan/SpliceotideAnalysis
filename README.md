@@ -54,6 +54,7 @@ flowchart LR
 | `plate_analysis_summaries.ipynb` | 96-well plate screens (point mutants, Rosetta designs). |
 | `plot_peptide_alignments.ipynb` | Stand-alone sequence-alignment figures. |
 | `input_excel_files/` | Sample sheets describing every LC-MS run analysed. |
+| `rosetta_protocols/` | RosettaScripts protocols used to model the designed precursors (see [`rosetta_protocols/README.md`](rosetta_protocols/README.md)). |
 | `legacy/` | Superseded scripts kept for provenance (see [`legacy/README.md`](legacy/README.md)). |
 
 > The core modules sit at the top level on purpose. Saved result pickles store
